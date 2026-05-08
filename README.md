@@ -2,7 +2,7 @@
 
 Go implementation of the Symphony orchestration service. Symphony is a long-running automation daemon that polls issue trackers for work, creates isolated workspaces per issue, and runs coding agents inside those workspaces.
 
-The authoritative service specification is [SPEC.md](../SPEC.md). This implementation conforms to it with Go-specific extensions documented in [SPEC-GO.md](SPEC-GO.md).
+The authoritative service specification is [SPEC.md](vendor/symphony/SPEC.md). This implementation conforms to it with Go-specific extensions documented in [SPEC-GO.md](SPEC-GO.md).
 
 ## Architecture
 

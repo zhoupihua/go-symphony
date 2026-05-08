@@ -1,6 +1,6 @@
 # Symphony Go Implementation Specification
 
-This document captures Go-specific extensions and implementation details beyond the language-agnostic [SPEC.md](../SPEC.md). When this document conflicts with SPEC.md on Go-specific behavior, this document takes precedence. For all other behavior, SPEC.md is the authority.
+This document captures Go-specific extensions and implementation details beyond the language-agnostic [SPEC.md](vendor/symphony/SPEC.md). When this document conflicts with SPEC.md on Go-specific behavior, this document takes precedence. For all other behavior, SPEC.md is the authority.
 
 ## Module
 
