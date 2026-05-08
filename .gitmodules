@@ -1,3 +1,0 @@
-[submodule "vendor/symphony"]
-	path = vendor/symphony
-	url = https://github.com/openai/symphony.git
