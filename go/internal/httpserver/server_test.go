@@ -318,8 +318,8 @@ func TestMiddlewareCORS(t *testing.T) {
 	}
 
 	methods := resp.Header.Get("Access-Control-Allow-Methods")
-	if methods != "GET, POST, OPTIONS" {
-		t.Errorf("expected Access-Control-Allow-Methods='GET, POST, OPTIONS', got %q", methods)
+	if methods != "GET, POST, DELETE, OPTIONS" {
+		t.Errorf("expected Access-Control-Allow-Methods='GET, POST, DELETE, OPTIONS', got %q", methods)
 	}
 
 	headers := resp.Header.Get("Access-Control-Allow-Headers")
@@ -533,5 +533,222 @@ func TestDashboardRunningIssues(t *testing.T) {
 	}
 	if !strings.Contains(bodyStr, "Running: <strong>1</strong> / 10") {
 		t.Error("expected running count '1 / 10' in response")
+	}
+}
+
+// mockClusterElector implements both ha.Elector and ha.ClusterManager.
+type mockClusterElector struct {
+	mockElector
+	members   []ha.ClusterMember
+	addErr    error
+	removeErr error
+}
+
+func (m *mockClusterElector) ApplyCommand(_, _ string, _ []byte) error { return nil }
+func (m *mockClusterElector) ReplicatedState() ([]byte, error)         { return nil, nil }
+
+func (m *mockClusterElector) AddVoter(_ context.Context, id, addr string) error {
+	if m.addErr != nil {
+		return m.addErr
+	}
+	m.members = append(m.members, ha.ClusterMember{ID: id, Address: addr, IsLeader: false})
+	return nil
+}
+
+func (m *mockClusterElector) RemoveServer(_ context.Context, id string) error {
+	if m.removeErr != nil {
+		return m.removeErr
+	}
+	for i, member := range m.members {
+		if member.ID == id {
+			m.members = append(m.members[:i], m.members[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+func (m *mockClusterElector) GetConfiguration() ([]ha.ClusterMember, error) {
+	return m.members, nil
+}
+
+func TestClusterGet(t *testing.T) {
+	state := &mockStateProvider{}
+	elector := &mockClusterElector{
+		mockElector: mockElector{leader: true, addr: "localhost:8080", done: make(chan struct{})},
+		members: []ha.ClusterMember{
+			{ID: "node1", Address: "127.0.0.1:9001", IsLeader: true},
+			{ID: "node2", Address: "127.0.0.1:9002", IsLeader: false},
+		},
+	}
+	refresh := &mockRefresher{}
+	srv := newTestServer(state, elector, refresh)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/cluster", nil)
+	w := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var members []clusterMemberJSON
+	if err := json.NewDecoder(resp.Body).Decode(&members); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(members) != 2 {
+		t.Errorf("expected 2 members, got %d", len(members))
+	}
+	if members[0].ID != "node1" {
+		t.Errorf("expected first member ID=node1, got %q", members[0].ID)
+	}
+	if !members[0].IsLeader {
+		t.Error("expected first member to be leader")
+	}
+}
+
+func TestClusterAddVoter(t *testing.T) {
+	state := &mockStateProvider{}
+	elector := &mockClusterElector{
+		mockElector: mockElector{leader: true, addr: "localhost:8080", done: make(chan struct{})},
+		members:     []ha.ClusterMember{{ID: "node1", Address: "127.0.0.1:9001", IsLeader: true}},
+	}
+	refresh := &mockRefresher{}
+	srv := newTestServer(state, elector, refresh)
+
+	body := `{"id":"node3","address":"127.0.0.1:9003"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cluster/voters", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("expected status 204, got %d", resp.StatusCode)
+	}
+
+	// Verify member was added.
+	if len(elector.members) != 2 {
+		t.Errorf("expected 2 members after add, got %d", len(elector.members))
+	}
+}
+
+func TestClusterAddVoterNotLeader(t *testing.T) {
+	state := &mockStateProvider{}
+	elector := &mockClusterElector{
+		mockElector: mockElector{leader: false, addr: "", done: make(chan struct{})},
+		members:     []ha.ClusterMember{},
+	}
+	refresh := &mockRefresher{}
+	srv := newTestServer(state, elector, refresh)
+
+	body := `{"id":"node3","address":"127.0.0.1:9003"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cluster/voters", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", resp.StatusCode)
+	}
+}
+
+func TestClusterAddVoterMissingFields(t *testing.T) {
+	state := &mockStateProvider{}
+	elector := &mockClusterElector{
+		mockElector: mockElector{leader: true, addr: "localhost:8080", done: make(chan struct{})},
+		members:     []ha.ClusterMember{},
+	}
+	refresh := &mockRefresher{}
+	srv := newTestServer(state, elector, refresh)
+
+	body := `{"id":"node3"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cluster/voters", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestClusterRemoveServer(t *testing.T) {
+	state := &mockStateProvider{}
+	elector := &mockClusterElector{
+		mockElector: mockElector{leader: true, addr: "localhost:8080", done: make(chan struct{})},
+		members: []ha.ClusterMember{
+			{ID: "node1", Address: "127.0.0.1:9001", IsLeader: true},
+			{ID: "node2", Address: "127.0.0.1:9002", IsLeader: false},
+		},
+	}
+	refresh := &mockRefresher{}
+	srv := newTestServer(state, elector, refresh)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/cluster/servers/node2", nil)
+	w := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("expected status 204, got %d", resp.StatusCode)
+	}
+
+	// Verify member was removed.
+	if len(elector.members) != 1 {
+		t.Errorf("expected 1 member after remove, got %d", len(elector.members))
+	}
+}
+
+func TestClusterRemoveServerNotLeader(t *testing.T) {
+	state := &mockStateProvider{}
+	elector := &mockClusterElector{
+		mockElector: mockElector{leader: false, addr: "", done: make(chan struct{})},
+		members:     []ha.ClusterMember{{ID: "node1", Address: "127.0.0.1:9001", IsLeader: true}},
+	}
+	refresh := &mockRefresher{}
+	srv := newTestServer(state, elector, refresh)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/cluster/servers/node1", nil)
+	w := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", resp.StatusCode)
+	}
+}
+
+func TestClusterEndpointsNotRegisteredWithoutHA(t *testing.T) {
+	state := &mockStateProvider{}
+	// Regular mockElector does NOT implement ClusterManager.
+	elector := newMockElector(true)
+	refresh := &mockRefresher{}
+	srv := newTestServer(state, elector, refresh)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/cluster", nil)
+	w := httptest.NewRecorder()
+	srv.http.Handler.ServeHTTP(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected status 404 when HA not enabled, got %d", resp.StatusCode)
 	}
 }

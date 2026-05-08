@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -707,5 +708,453 @@ func TestScheduleRetry_FailureAttemptIncrement(t *testing.T) {
 	// Failure retry should increment attempt.
 	if entry.Attempt != 3 {
 		t.Errorf("failure retry attempt = %d, want 3", entry.Attempt)
+	}
+}
+
+// mockReplicator records ApplyCommand calls for verification.
+type mockReplicator struct {
+	mu   sync.Mutex
+	cmds []replicatedCmd
+}
+
+type replicatedCmd struct {
+	Op   string
+	Key  string
+	Data string
+}
+
+func (m *mockReplicator) ApplyCommand(op, key string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cmds = append(m.cmds, replicatedCmd{Op: op, Key: key, Data: string(data)})
+	return nil
+}
+
+func (m *mockReplicator) ReplicatedState() ([]byte, error) {
+	return nil, nil
+}
+
+func (m *mockReplicator) commands() []replicatedCmd {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]replicatedCmd{}, m.cmds...)
+}
+
+func TestStateReplication_SetRunning(t *testing.T) {
+	mock := &mockReplicator{}
+	s := NewStateWithReplicator(mock)
+
+	s.SetRunning("1", &RunInfo{
+		Issue:        tracker.Issue{ID: "1", Identifier: "PROJ-1", Title: "Test", State: "in_progress"},
+		WorkerHost:   "host1",
+		Attempt:      1,
+		StartedAt:    time.Now(),
+		LastActivity: time.Now(),
+		Phase:        PhaseCreatingWorkspace,
+	})
+
+	cmds := mock.commands()
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 replicated command, got %d", len(cmds))
+	}
+	if cmds[0].Op != "set_running" {
+		t.Errorf("op = %q, want %q", cmds[0].Op, "set_running")
+	}
+	if cmds[0].Key != "1" {
+		t.Errorf("key = %q, want %q", cmds[0].Key, "1")
+	}
+}
+
+func TestStateReplication_RemoveRunning(t *testing.T) {
+	mock := &mockReplicator{}
+	s := NewStateWithReplicator(mock)
+
+	s.SetRunning("1", &RunInfo{Issue: tracker.Issue{ID: "1"}})
+	// Reset mock to count only RemoveRunning.
+	mock.cmds = nil
+
+	s.RemoveRunning("1")
+
+	cmds := mock.commands()
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 replicated command, got %d", len(cmds))
+	}
+	if cmds[0].Op != "remove_running" {
+		t.Errorf("op = %q, want %q", cmds[0].Op, "remove_running")
+	}
+}
+
+func TestStateReplication_ClaimRelease(t *testing.T) {
+	mock := &mockReplicator{}
+	s := NewStateWithReplicator(mock)
+
+	s.Claim("1")
+	s.ReleaseClaim("1")
+
+	cmds := mock.commands()
+	if len(cmds) != 2 {
+		t.Fatalf("expected 2 replicated commands, got %d", len(cmds))
+	}
+	if cmds[0].Op != "claim" {
+		t.Errorf("op[0] = %q, want %q", cmds[0].Op, "claim")
+	}
+	if cmds[1].Op != "release_claim" {
+		t.Errorf("op[1] = %q, want %q", cmds[1].Op, "release_claim")
+	}
+}
+
+func TestStateReplication_SetRetryRemoveRetry(t *testing.T) {
+	mock := &mockReplicator{}
+	s := NewStateWithReplicator(mock)
+
+	s.SetRetry("1", &RetryEntry{
+		Issue:      tracker.Issue{ID: "1", Identifier: "P-1", State: "in_progress"},
+		Attempt:    2,
+		FireAt:     time.Now().Add(10 * time.Second),
+		IsContinue: false,
+	})
+	s.RemoveRetry("1")
+
+	cmds := mock.commands()
+	if len(cmds) != 2 {
+		t.Fatalf("expected 2 replicated commands, got %d", len(cmds))
+	}
+	if cmds[0].Op != "add_retry" {
+		t.Errorf("op[0] = %q, want %q", cmds[0].Op, "add_retry")
+	}
+	if cmds[1].Op != "remove_retry" {
+		t.Errorf("op[1] = %q, want %q", cmds[1].Op, "remove_retry")
+	}
+}
+
+func TestStateReplication_MarkCompleted(t *testing.T) {
+	mock := &mockReplicator{}
+	s := NewStateWithReplicator(mock)
+
+	s.MarkCompleted("1")
+
+	cmds := mock.commands()
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 replicated command, got %d", len(cmds))
+	}
+	if cmds[0].Op != "mark_completed" {
+		t.Errorf("op = %q, want %q", cmds[0].Op, "mark_completed")
+	}
+}
+
+func TestStateReplication_UpdateActivity(t *testing.T) {
+	mock := &mockReplicator{}
+	s := NewStateWithReplicator(mock)
+
+	s.SetRunning("1", &RunInfo{
+		Issue:        tracker.Issue{ID: "1"},
+		StartedAt:    time.Now(),
+		LastActivity: time.Now(),
+	})
+	mock.cmds = nil
+
+	s.UpdateActivity("1")
+
+	cmds := mock.commands()
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 replicated command, got %d", len(cmds))
+	}
+	if cmds[0].Op != "set_running" {
+		t.Errorf("op = %q, want %q", cmds[0].Op, "set_running")
+	}
+}
+
+func TestStateReplication_UpdateUsage(t *testing.T) {
+	mock := &mockReplicator{}
+	s := NewStateWithReplicator(mock)
+
+	s.SetRunning("1", &RunInfo{
+		Issue:        tracker.Issue{ID: "1"},
+		StartedAt:    time.Now(),
+		LastActivity: time.Now(),
+	})
+	mock.cmds = nil
+
+	s.UpdateUsage("1", agent.UsageReport{InputTokens: 100, OutputTokens: 50, TotalTokens: 150})
+
+	cmds := mock.commands()
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 replicated command, got %d", len(cmds))
+	}
+	if cmds[0].Op != "set_running" {
+		t.Errorf("op = %q, want %q", cmds[0].Op, "set_running")
+	}
+}
+
+func TestStateReplication_SetPhase(t *testing.T) {
+	mock := &mockReplicator{}
+	s := NewStateWithReplicator(mock)
+
+	s.SetRunning("1", &RunInfo{
+		Issue:        tracker.Issue{ID: "1"},
+		StartedAt:    time.Now(),
+		LastActivity: time.Now(),
+	})
+	mock.cmds = nil
+
+	s.SetPhase("1", PhaseRunningTurns)
+
+	cmds := mock.commands()
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 replicated command, got %d", len(cmds))
+	}
+	if cmds[0].Op != "set_running" {
+		t.Errorf("op = %q, want %q", cmds[0].Op, "set_running")
+	}
+}
+
+func TestStateReplication_NoReplicatorIsNoOp(t *testing.T) {
+	s := NewState()
+	// These should not panic with nil replicator.
+	s.SetRunning("1", &RunInfo{Issue: tracker.Issue{ID: "1"}})
+	s.RemoveRunning("1")
+	s.Claim("1")
+	s.ReleaseClaim("1")
+	s.SetRetry("1", &RetryEntry{Attempt: 1})
+	s.RemoveRetry("1")
+	s.MarkCompleted("1")
+	s.UpdateActivity("1")
+	s.UpdateUsage("1", agent.UsageReport{})
+	s.SetPhase("1", "test")
+	s.UpdateSessionID("1", "sess-1")
+	s.UpdateLastError("1", "err")
+}
+
+func TestRestoreState_RoundTrip(t *testing.T) {
+	original := NewState()
+	now := time.Now().Truncate(time.Millisecond)
+
+	// Populate with realistic data.
+	original.SetRunning("1", &RunInfo{
+		Issue:         tracker.Issue{ID: "1", Identifier: "PROJ-1", Title: "Bug fix", State: "in_progress", Labels: []string{"bug"}, URL: "https://example.com/1", BranchName: "fix-1"},
+		WorkerHost:    "worker1:22",
+		WorkspacePath: "/tmp/ws/proj-1",
+		Attempt:       2,
+		StartedAt:     now.Add(-5 * time.Minute),
+		LastActivity:  now,
+		TurnCount:     7,
+		TotalUsage:    agent.UsageReport{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
+		SessionID:     "sess-abc",
+		LastError:     "",
+		Phase:         PhaseRunningTurns,
+		LastReportedInputTokens:  1000,
+		LastReportedOutputTokens: 500,
+		LastReportedTotalTokens:  1500,
+	})
+
+	original.SetRunning("2", &RunInfo{
+		Issue:        tracker.Issue{ID: "2", Identifier: "PROJ-2", Title: "Feature", State: "todo"},
+		WorkerHost:   "",
+		WorkspacePath: "/tmp/ws/proj-2",
+		Attempt:      1,
+		StartedAt:    now.Add(-1 * time.Minute),
+		LastActivity: now,
+		TurnCount:    0,
+		Phase:        PhaseCreatingWorkspace,
+	})
+
+	original.Claim("3")
+	original.MarkCompleted("4")
+
+	original.SetRetry("5", &RetryEntry{
+		Issue:      tracker.Issue{ID: "5", Identifier: "PROJ-5", State: "in_progress"},
+		Attempt:    3,
+		FireAt:     now.Add(30 * time.Second),
+		IsContinue: true,
+	})
+
+	original.AddRuntimeMs(12345)
+
+	// Serialize using the FSM state format (matching ha.fsmState).
+	import_json_marshal := func(v any) []byte {
+		b, _ := json.Marshal(v)
+		return b
+	}
+
+	running := map[string]json.RawMessage{
+		"1": import_json_marshal(runInfoToDTO(original.RunningIssue("1"))),
+		"2": import_json_marshal(runInfoToDTO(original.RunningIssue("2"))),
+	}
+	claimed := map[string]bool{"3": true}
+	completed := map[string]bool{"4": true}
+	retries := map[string]json.RawMessage{
+		"5": import_json_marshal(retryEntryToDTO(&RetryEntry{
+			Issue:      tracker.Issue{ID: "5", Identifier: "PROJ-5", State: "in_progress"},
+			Attempt:    3,
+			FireAt:     now.Add(30 * time.Second),
+			IsContinue: true,
+		})),
+	}
+
+	fsmData, _ := json.Marshal(map[string]any{
+		"running":         running,
+		"claimed":         claimed,
+		"completed":       completed,
+		"retries":         retries,
+		"total_runtime_ms": int64(12345),
+	})
+
+	// Restore into a fresh state.
+	restored := NewState()
+	if err := restored.RestoreState(fsmData); err != nil {
+		t.Fatalf("RestoreState failed: %v", err)
+	}
+
+	// Verify running.
+	if restored.RunningCount() != 2 {
+		t.Errorf("running count = %d, want 2", restored.RunningCount())
+	}
+
+	info1 := restored.RunningIssue("1")
+	if info1 == nil {
+		t.Fatal("issue 1 not found in restored state")
+	}
+	if info1.Issue.Identifier != "PROJ-1" {
+		t.Errorf("identifier = %q, want %q", info1.Issue.Identifier, "PROJ-1")
+	}
+	if info1.Issue.Title != "Bug fix" {
+		t.Errorf("title = %q, want %q", info1.Issue.Title, "Bug fix")
+	}
+	if info1.WorkerHost != "worker1:22" {
+		t.Errorf("workerHost = %q, want %q", info1.WorkerHost, "worker1:22")
+	}
+	if info1.WorkspacePath != "/tmp/ws/proj-1" {
+		t.Errorf("workspacePath = %q, want %q", info1.WorkspacePath, "/tmp/ws/proj-1")
+	}
+	if info1.Attempt != 2 {
+		t.Errorf("attempt = %d, want 2", info1.Attempt)
+	}
+	if info1.TurnCount != 7 {
+		t.Errorf("turnCount = %d, want 7", info1.TurnCount)
+	}
+	if info1.TotalUsage.InputTokens != 1000 {
+		t.Errorf("inputTokens = %d, want 1000", info1.TotalUsage.InputTokens)
+	}
+	if info1.SessionID != "sess-abc" {
+		t.Errorf("sessionID = %q, want %q", info1.SessionID, "sess-abc")
+	}
+	if info1.Phase != PhaseRunningTurns {
+		t.Errorf("phase = %q, want %q", info1.Phase, PhaseRunningTurns)
+	}
+	if info1.LastReportedInputTokens != 1000 {
+		t.Errorf("lastReportedInputTokens = %d, want 1000", info1.LastReportedInputTokens)
+	}
+
+	// Verify claimed.
+	if !restored.IsClaimed("3") {
+		t.Error("issue 3 should be claimed")
+	}
+
+	// Verify completed.
+	if !restored.IsCompleted("4") {
+		t.Error("issue 4 should be completed")
+	}
+
+	// Verify retries.
+	pending := restored.PendingRetries()
+	if len(pending) != 1 {
+		t.Fatalf("pending retries = %d, want 1", len(pending))
+	}
+	if pending["5"].Attempt != 3 {
+		t.Errorf("retry attempt = %d, want 3", pending["5"].Attempt)
+	}
+	if !pending["5"].IsContinue {
+		t.Error("retry should be continuation")
+	}
+
+	// Verify runtime.
+	if restored.TotalRuntimeSeconds() < 12.0 {
+		t.Errorf("totalRuntimeSeconds = %f, want >= 12.0", restored.TotalRuntimeSeconds())
+	}
+}
+
+func TestRestoreState_EmptyData(t *testing.T) {
+	s := NewState()
+	data, _ := json.Marshal(map[string]any{
+		"running":   map[string]any{},
+		"claimed":   map[string]any{},
+		"completed": map[string]any{},
+		"retries":   map[string]any{},
+	})
+
+	if err := s.RestoreState(data); err != nil {
+		t.Fatalf("RestoreState with empty data failed: %v", err)
+	}
+	if s.RunningCount() != 0 {
+		t.Error("running count should be 0 after empty restore")
+	}
+}
+
+func TestSetReplicator(t *testing.T) {
+	cfg := testOrchConfig()
+	o := New(nil, nil, nil, func() config.Schema { return cfg }, func() string { return "test" })
+
+	mock := &mockReplicator{}
+	o.SetReplicator(mock)
+
+	if o.State.replicator != mock {
+		t.Error("replicator not set on state")
+	}
+}
+
+func TestRestoreFromReplicator_NilReplicator(t *testing.T) {
+	cfg := testOrchConfig()
+	o := New(nil, nil, nil, func() config.Schema { return cfg }, func() string { return "test" })
+
+	// Should not panic with nil replicator.
+	o.RestoreFromReplicator()
+}
+
+// mockReplicatorWithState supports both ApplyCommand and ReplicatedState.
+type mockReplicatorWithState struct {
+	mockReplicator
+	state []byte
+}
+
+func (m *mockReplicatorWithState) ReplicatedState() ([]byte, error) {
+	return m.state, nil
+}
+
+func TestRestoreFromReplicator_WithData(t *testing.T) {
+	cfg := testOrchConfig()
+	o := New(nil, nil, nil, func() config.Schema { return cfg }, func() string { return "test" })
+
+	// Build replicated state data.
+	now := time.Now().Truncate(time.Millisecond)
+	runningDTO := runInfoToDTO(&RunInfo{
+		Issue:        tracker.Issue{ID: "1", Identifier: "P-1", State: "in_progress"},
+		Attempt:      1,
+		StartedAt:    now,
+		LastActivity: now,
+		Phase:        PhaseRunningTurns,
+	})
+	runningJSON, _ := json.Marshal(runningDTO)
+	fsmData, _ := json.Marshal(map[string]any{
+		"running":         map[string]json.RawMessage{"1": runningJSON},
+		"claimed":         map[string]bool{},
+		"completed":       map[string]bool{},
+		"retries":         map[string]any{},
+		"total_runtime_ms": 0,
+	})
+
+	mock := &mockReplicatorWithState{state: fsmData}
+	o.SetReplicator(mock)
+
+	o.RestoreFromReplicator()
+
+	if o.State.RunningCount() != 1 {
+		t.Errorf("running count = %d, want 1 after restore", o.State.RunningCount())
+	}
+	info := o.State.RunningIssue("1")
+	if info == nil {
+		t.Fatal("issue 1 not found after restore")
+	}
+	if info.Issue.Identifier != "P-1" {
+		t.Errorf("identifier = %q, want %q", info.Issue.Identifier, "P-1")
 	}
 }

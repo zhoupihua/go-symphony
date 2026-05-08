@@ -66,8 +66,7 @@ func TestParse_AllFieldsSpecified(t *testing.T) {
 		},
 		"ha": map[string]any{
 			"enabled":        true,
-			"etcd_endpoints": []any{"etcd1:2379", "etcd2:2379"},
-			"lease_ttl_ms":   10000,
+			"raft_peers": []any{"10.0.0.5:9300", "10.0.0.6:9300"},
 			"advertise_addr": "10.0.0.5:8080",
 		},
 		"server": map[string]any{
@@ -197,11 +196,8 @@ func TestParse_AllFieldsSpecified(t *testing.T) {
 	if !s.HA.Enabled {
 		t.Error("HA.Enabled = false, want true")
 	}
-	if len(s.HA.EtcdEndpoints) != 2 {
-		t.Errorf("HA.EtcdEndpoints = %v, want 2 items", s.HA.EtcdEndpoints)
-	}
-	if s.HA.LeaseTTLMS != 10000 {
-		t.Errorf("HA.LeaseTTLMS = %d, want 10000", s.HA.LeaseTTLMS)
+	if len(s.HA.RaftPeers) != 2 {
+		t.Errorf("HA.RaftPeers = %v, want 2 items", s.HA.RaftPeers)
 	}
 	if s.HA.AdvertiseAddr != "10.0.0.5:8080" {
 		t.Errorf("HA.AdvertiseAddr = %q, want %q", s.HA.AdvertiseAddr, "10.0.0.5:8080")
@@ -298,9 +294,6 @@ func TestParse_PartialConfig(t *testing.T) {
 	}
 	if s.Server.Host != "localhost" {
 		t.Errorf("Server.Host = %q, want %q (default)", s.Server.Host, "localhost")
-	}
-	if s.HA.LeaseTTLMS != 5000 {
-		t.Errorf("HA.LeaseTTLMS = %d, want 5000 (default)", s.HA.LeaseTTLMS)
 	}
 }
 

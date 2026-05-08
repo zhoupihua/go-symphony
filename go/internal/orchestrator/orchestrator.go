@@ -62,6 +62,34 @@ func New(tr tracker.Tracker, ag agent.Agent, el ha.Elector, cfgFn func() config.
 	}
 }
 
+// SetReplicator enables state replication for HA deployments.
+// Must be called before Run(). If the elector implements StateReplicator,
+// it is used to replicate all state mutations and restore state on failover.
+func (o *Orchestrator) SetReplicator(r ha.StateReplicator) {
+	o.State.replicator = r
+}
+
+// RestoreFromReplicator restores orchestrator state from the replicated FSM.
+// Called after winning an election to recover in-flight state.
+func (o *Orchestrator) RestoreFromReplicator() {
+	if o.State.replicator == nil {
+		return
+	}
+	data, err := o.State.replicator.ReplicatedState()
+	if err != nil {
+		slog.Warn("restore from replicator: failed to get state", "error", err)
+		return
+	}
+	if len(data) == 0 {
+		return
+	}
+	if err := o.State.RestoreState(data); err != nil {
+		slog.Warn("restore from replicator: failed to restore", "error", err)
+	} else {
+		slog.Info("restored orchestrator state from replicator", "running", o.State.RunningCount(), "retries", o.State.RetryCount())
+	}
+}
+
 // selectWorkerHost picks a host from the SSH host pool using round-robin.
 // Returns empty string for local execution.
 func (o *Orchestrator) selectWorkerHost(cfg config.Schema) string {
@@ -87,9 +115,27 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	interval := cfgPollInterval(cfg)
 
 	for {
+		// Watch for leadership loss in HA mode.
+		var doneCh <-chan struct{}
+		if o.Elector != nil {
+			doneCh = o.Elector.Done()
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-doneCh:
+			// Leadership lost — re-campaign and restore state.
+			slog.Warn("leadership lost, re-campaigning")
+			if err := o.Elector.Campaign(ctx); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				slog.Error("re-campaign failed", "error", err)
+				return err
+			}
+			o.RestoreFromReplicator()
+			continue
 		case <-time.After(interval):
 			// Re-read config for hot-reload.
 			cfg = o.Cfg()

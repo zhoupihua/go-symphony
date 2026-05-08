@@ -141,11 +141,8 @@ func applyDefaults(s *Schema) {
 		s.Agent.Kind = "codex"
 	}
 	// HA defaults
-	if len(s.HA.EtcdEndpoints) == 0 {
-		s.HA.EtcdEndpoints = []string{"localhost:2379"}
-	}
-	if s.HA.LeaseTTLMS == 0 {
-		s.HA.LeaseTTLMS = 5000
+	if s.HA.RaftDir == "" && s.Workspace.Root != "" {
+		s.HA.RaftDir = filepath.Join(s.Workspace.Root, "raft")
 	}
 	// Server defaults
 	if s.Server.Host == "" {
@@ -249,6 +246,16 @@ func Validate(s *Schema) error {
 	}
 	if s.Agent.Kind == "claude" && s.Agent.Claude.Command == "" {
 		errs = append(errs, fmt.Errorf("agent.claude.command is required when agent.kind is \"claude\""))
+	}
+
+	// HA validation
+	if s.HA.Enabled {
+		if len(s.HA.RaftPeers) == 0 {
+			errs = append(errs, fmt.Errorf("ha.raft_peers is required when ha.enabled is true"))
+		}
+		if s.HA.AdvertiseAddr == "" {
+			errs = append(errs, fmt.Errorf("ha.advertise_addr is required when ha.enabled is true"))
+		}
 	}
 
 	return errors.Join(errs...)

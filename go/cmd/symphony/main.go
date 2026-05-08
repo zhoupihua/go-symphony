@@ -84,17 +84,17 @@ func main() {
 	// Create elector.
 	var elector ha.Elector
 	if cfg.HA.Enabled {
-		etcdElector, err := ha.NewEtcdElector(ha.EtcdConfig{
-			Endpoints:     cfg.HA.EtcdEndpoints,
-			LeaseTTL:      cfg.HA.LeaseTTLMS / 1000,
+		raftElector, err := ha.NewRaftElector(ha.RaftConfig{
+			Peers:         cfg.HA.RaftPeers,
 			AdvertiseAddr: cfg.HA.AdvertiseAddr,
+			RaftDir:       cfg.HA.RaftDir,
 		})
 		if err != nil {
-			slog.Error("create etcd elector", "error", err)
+			slog.Error("create raft elector", "error", err)
 			os.Exit(1)
 		}
-		elector = etcdElector
-		slog.Info("HA enabled, using etcd elector", "endpoints", cfg.HA.EtcdEndpoints, "advertise", cfg.HA.AdvertiseAddr)
+		elector = raftElector
+		slog.Info("HA enabled, using raft elector", "peers", cfg.HA.RaftPeers, "advertise", cfg.HA.AdvertiseAddr)
 	} else {
 		elector = ha.NewLocalElector()
 	}
@@ -132,11 +132,19 @@ func main() {
 		},
 	)
 
+	// Wire state replicator for HA mode.
+	if sr, ok := elector.(ha.StateReplicator); ok {
+		orch.SetReplicator(sr)
+	}
+
 	// Campaign for leadership.
 	if err := elector.Campaign(ctx); err != nil {
 		slog.Error("campaign for leadership", "error", err)
 		os.Exit(1)
 	}
+
+	// Restore state from replicator after winning election.
+	orch.RestoreFromReplicator()
 
 	// Run orchestrator.
 	go func() {

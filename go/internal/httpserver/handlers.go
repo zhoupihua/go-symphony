@@ -259,3 +259,97 @@ func (s *Server) buildStateResponse() stateResponse {
 		RetryQueue:   retryQueue,
 	}
 }
+
+// clusterMemberJSON is the JSON representation of a cluster member.
+type clusterMemberJSON struct {
+	ID       string `json:"id"`
+	Address  string `json:"address"`
+	IsLeader bool   `json:"is_leader"`
+}
+
+// addVoterRequest is the JSON request for adding a voter.
+type addVoterRequest struct {
+	ID      string `json:"id"`
+	Address string `json:"address"`
+}
+
+// handleClusterGet returns the current cluster membership.
+func (s *Server) handleClusterGet(w http.ResponseWriter, r *http.Request) {
+	if s.clusterManager == nil {
+		writeJSONError(w, http.StatusNotFound, "cluster management not available")
+		return
+	}
+
+	members, err := s.clusterManager.GetConfiguration()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to get cluster configuration")
+		return
+	}
+
+	resp := make([]clusterMemberJSON, len(members))
+	for i, m := range members {
+		resp[i] = clusterMemberJSON{ID: m.ID, Address: m.Address, IsLeader: m.IsLeader}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleClusterAddVoter adds a new voter to the cluster.
+func (s *Server) handleClusterAddVoter(w http.ResponseWriter, r *http.Request) {
+	if s.clusterManager == nil {
+		writeJSONError(w, http.StatusNotFound, "cluster management not available")
+		return
+	}
+
+	if !s.isLeader() {
+		writeJSONError(w, http.StatusServiceUnavailable, "not leader")
+		return
+	}
+
+	var req addVoterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.ID == "" || req.Address == "" {
+		writeJSONError(w, http.StatusBadRequest, "id and address are required")
+		return
+	}
+
+	if err := s.clusterManager.AddVoter(r.Context(), req.ID, req.Address); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleClusterRemoveServer removes a server from the cluster.
+func (s *Server) handleClusterRemoveServer(w http.ResponseWriter, r *http.Request) {
+	if s.clusterManager == nil {
+		writeJSONError(w, http.StatusNotFound, "cluster management not available")
+		return
+	}
+
+	if !s.isLeader() {
+		writeJSONError(w, http.StatusServiceUnavailable, "not leader")
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing server id")
+		return
+	}
+
+	if err := s.clusterManager.RemoveServer(r.Context(), id); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNoContent)
+}

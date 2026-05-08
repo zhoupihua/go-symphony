@@ -45,12 +45,13 @@ type Refresher interface {
 
 // Server is the HTTP API server for the Symphony dashboard.
 type Server struct {
-	state         StateProvider
-	elector       ha.Elector
-	refresh       Refresher
-	cfg           config.ServerConfig
-	maxConcurrent int
-	http          *http.Server
+	state          StateProvider
+	elector        ha.Elector
+	clusterManager ha.ClusterManager
+	refresh        Refresher
+	cfg            config.ServerConfig
+	maxConcurrent  int
+	http           *http.Server
 }
 
 // New creates a new Server with the given dependencies.
@@ -61,6 +62,11 @@ func New(state StateProvider, elector ha.Elector, refresh Refresher, cfg config.
 		refresh:       refresh,
 		cfg:           cfg,
 		maxConcurrent: maxConcurrent,
+	}
+
+	// Auto-detect ClusterManager from elector.
+	if cm, ok := elector.(ha.ClusterManager); ok {
+		s.clusterManager = cm
 	}
 
 	addr := fmt.Sprintf("%s:%d", hostOrDefault(cfg.Host), portOrDefault(cfg.Port))
@@ -78,6 +84,14 @@ func New(state StateProvider, elector ha.Elector, refresh Refresher, cfg config.
 	mux.HandleFunc("OPTIONS /api/v1/refresh", s.cors(s.handleOptions))
 	mux.HandleFunc("GET /api/v1/events", s.cors(s.handleEvents))
 	mux.HandleFunc("OPTIONS /api/v1/events", s.cors(s.handleOptions))
+
+	// Cluster management endpoints.
+	mux.HandleFunc("GET /api/v1/cluster", s.cors(s.handleClusterGet))
+	mux.HandleFunc("OPTIONS /api/v1/cluster", s.cors(s.handleOptions))
+	mux.HandleFunc("POST /api/v1/cluster/voters", s.cors(s.handleClusterAddVoter))
+	mux.HandleFunc("OPTIONS /api/v1/cluster/voters", s.cors(s.handleOptions))
+	mux.HandleFunc("DELETE /api/v1/cluster/servers/{id}", s.cors(s.handleClusterRemoveServer))
+	mux.HandleFunc("OPTIONS /api/v1/cluster/servers/{id}", s.cors(s.handleOptions))
 
 	s.http = &http.Server{
 		Addr:              addr,
@@ -131,7 +145,7 @@ func (s *Server) Addr() string {
 func (s *Server) cors(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		next(w, r)
 	}

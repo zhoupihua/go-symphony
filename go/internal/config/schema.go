@@ -82,8 +82,8 @@ type WorkerConfig struct {
 
 type HAConfig struct {
 	Enabled       bool     `yaml:"enabled"`
-	EtcdEndpoints []string `yaml:"etcd_endpoints"`
-	LeaseTTLMS    int      `yaml:"lease_ttl_ms"`
+	RaftPeers     []string `yaml:"raft_peers"`
+	RaftDir       string   `yaml:"raft_dir"`
 	AdvertiseAddr string   `yaml:"advertise_addr"`
 }
 
