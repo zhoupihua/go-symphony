@@ -21,6 +21,13 @@ type RunInfo struct {
 	TotalUsage    agent.UsageReport
 	SessionID     string // "<thread_id>-<turn_id>" for observability
 	LastError     string // most recent error message for this run
+	Phase         string // current run phase
+
+	// Delta token tracking: last reported values from the agent.
+	// Used to compute per-turn deltas when agents report cumulative totals.
+	LastReportedInputTokens  int64
+	LastReportedOutputTokens int64
+	LastReportedTotalTokens  int64
 }
 
 // RetryEntry tracks a pending retry for an issue.
@@ -103,6 +110,17 @@ func (s *State) RunningByState() map[string]int {
 	counts := make(map[string]int)
 	for _, info := range s.running {
 		counts[strings.ToLower(info.Issue.State)]++
+	}
+	return counts
+}
+
+// RunningByHost returns the count of running issues on each worker host.
+func (s *State) RunningByHost() map[string]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	counts := make(map[string]int)
+	for _, info := range s.running {
+		counts[info.WorkerHost]++
 	}
 	return counts
 }
@@ -196,15 +214,51 @@ func (s *State) UpdateActivity(issueID string) {
 	}
 }
 
-// UpdateUsage updates the usage counters for a running issue.
+// UpdateUsage updates the usage counters for a running issue using delta
+// tracking. If the agent reports cumulative totals, only the positive delta
+// from the last reported value is added. If the agent reports per-turn deltas,
+// the full value is added (since lastReported starts at 0).
 func (s *State) UpdateUsage(issueID string, usage agent.UsageReport) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if info, ok := s.running[issueID]; ok {
-		info.TotalUsage.InputTokens += usage.InputTokens
-		info.TotalUsage.OutputTokens += usage.OutputTokens
-		info.TotalUsage.TotalTokens += usage.TotalTokens
+		inputDelta := usage.InputTokens - info.LastReportedInputTokens
+		outputDelta := usage.OutputTokens - info.LastReportedOutputTokens
+		totalDelta := usage.TotalTokens - info.LastReportedTotalTokens
+
+		if inputDelta > 0 {
+			info.TotalUsage.InputTokens += inputDelta
+		}
+		if outputDelta > 0 {
+			info.TotalUsage.OutputTokens += outputDelta
+		}
+		if totalDelta > 0 {
+			info.TotalUsage.TotalTokens += totalDelta
+		}
+
+		info.LastReportedInputTokens = usage.InputTokens
+		info.LastReportedOutputTokens = usage.OutputTokens
+		info.LastReportedTotalTokens = usage.TotalTokens
+
 		info.TurnCount++
+	}
+}
+
+// UpdateIssue replaces the Issue snapshot for a running entry.
+func (s *State) UpdateIssue(issueID string, issue tracker.Issue) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if info, ok := s.running[issueID]; ok {
+		info.Issue = issue
+	}
+}
+
+// SetPhase updates the phase for a running issue.
+func (s *State) SetPhase(issueID, phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if info, ok := s.running[issueID]; ok {
+		info.Phase = phase
 	}
 }
 

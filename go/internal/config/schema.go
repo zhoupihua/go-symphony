@@ -76,7 +76,8 @@ type ClaudeConfig struct {
 }
 
 type WorkerConfig struct {
-	SSHHosts []string `yaml:"ssh_hosts"`
+	SSHHosts                   []string `yaml:"ssh_hosts"`
+	MaxConcurrentAgentsPerHost int      `yaml:"max_concurrent_agents_per_host"`
 }
 
 type HAConfig struct {

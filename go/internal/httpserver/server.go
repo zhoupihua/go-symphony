@@ -152,7 +152,7 @@ func (s *Server) isLeader() bool {
 
 func hostOrDefault(host string) string {
 	if host == "" {
-		return "0.0.0.0"
+		return "127.0.0.1"
 	}
 	return host
 }

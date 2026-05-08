@@ -43,8 +43,9 @@ type linearIssue struct {
 	State       struct {
 		Name string `json:"name"`
 	} `json:"state"`
-	URL string `json:"url"`
-	Labels struct {
+	URL        string `json:"url"`
+	BranchName string `json:"branchName"`
+	Labels     struct {
 		Nodes []struct {
 			Name string `json:"name"`
 		} `json:"nodes"`

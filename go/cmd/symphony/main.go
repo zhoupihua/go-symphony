@@ -8,9 +8,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/ainative/go-symphony/internal/agent"
 	"github.com/ainative/go-symphony/internal/agent/claude"
@@ -34,6 +34,11 @@ func main() {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
 
+	// Positional arg overrides --config for convenience.
+	if flag.NArg() > 0 {
+		*cfgPath = flag.Arg(0)
+	}
+
 	if *showVersion {
 		fmt.Printf("symphony %s\n", version)
 		os.Exit(0)
@@ -55,14 +60,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	cfg, err := config.Parse(frontMatter)
+	absCfgPath, _ := filepath.Abs(*cfgPath)
+	cfg, err := config.Parse(frontMatter, filepath.Dir(absCfgPath))
 	if err != nil {
 		slog.Error("parse config", "error", err)
-		os.Exit(1)
-	}
-
-	if err := config.Validate(cfg); err != nil {
-		slog.Error("config validation", "error", err)
 		os.Exit(1)
 	}
 
@@ -109,30 +110,27 @@ func main() {
 	}
 	defer store.Close()
 
-	// Create orchestrator.
+	// Create orchestrator with closures that read from the store each tick.
+	// This eliminates the data race from the previous goroutine-based approach.
 	orch := orchestrator.New(
 		trk,
 		ag,
 		elector,
-		func() config.Schema { return *cfg },
-		func() string { return promptBody },
-	)
-
-	// Update config/template from store when available.
-	go func() {
-		for {
-			schema, body, err := store.Current()
+		func() config.Schema {
+			schema, _, err := store.Current()
+			if err != nil || schema == nil {
+				return *cfg
+			}
+			return *schema
+		},
+		func() string {
+			_, body, err := store.Current()
 			if err != nil {
-				slog.Warn("hot-reload: read current", "error", err)
-				return
+				return promptBody
 			}
-			if schema != nil && body != "" {
-				cfg = schema
-				promptBody = body
-			}
-			time.Sleep(1 * time.Second)
-		}
-	}()
+			return body
+		},
+	)
 
 	// Campaign for leadership.
 	if err := elector.Campaign(ctx); err != nil {

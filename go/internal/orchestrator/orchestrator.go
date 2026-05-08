@@ -24,17 +24,30 @@ const (
 	failureRetryBase       = 10 * time.Second
 )
 
+// Phase constants track the lifecycle of an agent run.
+const (
+	PhaseInitializing        = "initializing"
+	PhaseCreatingWorkspace   = "creating_workspace"
+	PhaseStartingSession     = "starting_session"
+	PhaseRunningTurns        = "running_turns"
+	PhaseSucceeded           = "succeeded"
+	PhaseFailed              = "failed"
+	PhaseTimedOut            = "timed_out"
+	PhaseStalled             = "stalled"
+	PhaseCanceledByReconcile = "canceled_by_reconciliation"
+)
+
 // Orchestrator is the main coordination loop. It polls the tracker for
 // candidate issues, dispatches them to agent runners up to concurrency limits,
 // and reconciles running issues for stall detection and state changes.
 type Orchestrator struct {
-	Tracker      tracker.Tracker
-	Agent        agent.Agent
-	Elector      ha.Elector
-	Cfg          func() config.Schema // called each tick for hot-reload support
-	Tmpl         func() string        // called each tick for hot-reload support
-	State        *State
-	nextHostIdx  int // round-robin index for SSH host selection
+	Tracker     tracker.Tracker
+	Agent       agent.Agent
+	Elector     ha.Elector
+	Cfg         func() config.Schema // called each tick for hot-reload support
+	Tmpl        func() string        // called each tick for hot-reload support
+	State       *State
+	nextHostIdx int // round-robin index for SSH host selection
 }
 
 // New creates a new Orchestrator.
@@ -108,28 +121,68 @@ func (o *Orchestrator) tick(ctx context.Context) {
 	// 2. Process due retries.
 	o.processRetries(ctx, cfg)
 
-	// 3. Fetch candidate issues.
+	// 3. Validate dispatch config before fetching candidates.
+	if err := validateDispatchConfig(cfg); err != nil {
+		slog.Warn("dispatch config invalid, skipping fetch", "error", err)
+		return
+	}
+
+	// 4. Fetch candidate issues.
 	candidates, err := o.Tracker.FetchCandidateIssues(ctx)
 	if err != nil {
 		slog.Error("fetch candidate issues", "error", err)
 		return
 	}
 
-	// 4. Sort and dispatch eligible.
+	// 5. Sort and dispatch eligible.
 	o.dispatch(ctx, cfg, candidates)
 }
 
+// validateDispatchConfig checks that the config has the minimum required fields
+// for dispatching work. This prevents wasted API calls when the config is
+// incomplete (e.g., during hot-reload of a partially-edited WORKFLOW.md).
+func validateDispatchConfig(cfg config.Schema) error {
+	if cfg.Tracker.Kind == "" {
+		return fmt.Errorf("tracker.kind is empty")
+	}
+	if cfg.Tracker.APIKey == "" {
+		return fmt.Errorf("tracker.api_key is empty")
+	}
+	if cfg.Tracker.Kind == "linear" && cfg.Tracker.Linear.ProjectSlug == "" {
+		return fmt.Errorf("tracker.linear.project_slug is empty")
+	}
+	if cfg.Agent.Kind == "" {
+		return fmt.Errorf("agent.kind is empty")
+	}
+	if cfg.Agent.Kind == "codex" && cfg.Agent.Codex.Command == "" {
+		return fmt.Errorf("agent.codex.command is empty")
+	}
+	if cfg.Agent.Kind == "claude" && cfg.Agent.Claude.Command == "" {
+		return fmt.Errorf("agent.claude.command is empty")
+	}
+	return nil
+}
+
 // reconcileRunning checks all running issues for stalls and state changes.
+// It batch-fetches all running issue IDs from the tracker and applies a
+// 3-way branch: terminal -> terminate + cleanup, active -> update snapshot,
+// neither -> terminate without cleanup.
 func (o *Orchestrator) reconcileRunning(ctx context.Context, cfg config.Schema) {
 	running := o.State.Running()
+	if len(running) == 0 {
+		return
+	}
+
 	stallTimeout := stallTimeout(cfg)
 
+	// Phase 1: Stall detection — collect IDs of non-stalled issues.
+	var nonStalledIDs []string
 	for issueID, info := range running {
-		// Stall detection.
 		if stallTimeout > 0 {
 			elapsed := time.Since(info.LastActivity)
 			if elapsed > stallTimeout {
-				slog.Warn("stall detected, terminating agent", "issue", issueID, "elapsed", elapsed)
+				slog.Warn("stall detected, terminating agent", "issue_id", issueID, "elapsed", elapsed)
+				o.State.SetPhase(issueID, PhaseStalled)
 				o.State.RemoveRunning(issueID)
 				o.State.ReleaseClaim(issueID)
 				o.addRuntime(info)
@@ -137,22 +190,59 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context, cfg config.Schema) 
 				continue
 			}
 		}
+		nonStalledIDs = append(nonStalledIDs, issueID)
+	}
 
-		// Check if issue has moved to a terminal state.
-		if o.Tracker != nil {
-			issues, err := o.Tracker.FetchIssueStatesByIDs(ctx, []string{issueID})
-			if err != nil {
-				slog.Warn("reconcile: failed to check issue state", "issue", issueID, "error", err)
-				continue
-			}
-			if len(issues) > 0 && isTerminalState(issues[0].State, cfg.Tracker.TerminalStates) {
-				slog.Info("issue moved to terminal state, stopping agent", "issue", issueID, "state", issues[0].State)
-				o.State.RemoveRunning(issueID)
-				o.State.ReleaseClaim(issueID)
-				o.addRuntime(info)
-				// Clean up workspace (local or remote).
-				o.removeWorkspace(ctx, cfg, info)
-			}
+	// Phase 2: Batch-fetch all non-stalled issue states.
+	if o.Tracker == nil || len(nonStalledIDs) == 0 {
+		return
+	}
+
+	fetched, err := o.Tracker.FetchIssueStatesByIDs(ctx, nonStalledIDs)
+	if err != nil {
+		slog.Warn("reconcile: batch fetch failed", "error", err)
+		return
+	}
+
+	// Build a lookup map from fetched issues.
+	fetchedMap := make(map[string]tracker.Issue, len(fetched))
+	for _, iss := range fetched {
+		fetchedMap[iss.ID] = iss
+	}
+
+	// Phase 3: 3-way branch for each non-stalled running issue.
+	for _, issueID := range nonStalledIDs {
+		info, ok := running[issueID]
+		if !ok {
+			continue // removed during stall phase
+		}
+
+		refreshed, found := fetchedMap[issueID]
+		if !found {
+			slog.Warn("reconcile: issue not found in tracker response", "issue_id", issueID)
+			continue
+		}
+
+		if isTerminalState(refreshed.State, cfg.Tracker.TerminalStates) {
+			// Terminal: terminate worker + clean up workspace.
+			slog.Info("issue moved to terminal state, stopping agent", "issue_id", issueID, "state", refreshed.State)
+			o.State.SetPhase(issueID, PhaseCanceledByReconcile)
+			o.State.RemoveRunning(issueID)
+			o.State.ReleaseClaim(issueID)
+			o.addRuntime(info)
+			o.removeWorkspace(ctx, cfg, info)
+		} else if isActiveState(refreshed.State, cfg.Tracker.ActiveStates) {
+			// Active: update issue snapshot in RunInfo.
+			o.State.UpdateIssue(issueID, refreshed)
+		} else {
+			// Neither active nor terminal (e.g., "In Review", "Triage"):
+			// terminate worker but don't clean up workspace — the issue
+			// might return to an active state later.
+			slog.Info("issue in non-active non-terminal state, stopping agent without cleanup", "issue_id", issueID, "state", refreshed.State)
+			o.State.SetPhase(issueID, PhaseCanceledByReconcile)
+			o.State.RemoveRunning(issueID)
+			o.State.ReleaseClaim(issueID)
+			o.addRuntime(info)
 		}
 	}
 }
@@ -205,7 +295,7 @@ func (o *Orchestrator) processRetries(ctx context.Context, cfg config.Schema) {
 				}
 			}
 			if !found {
-				slog.Info("retry: issue no longer in candidate list, releasing claim", "issue", issueID)
+				slog.Info("retry: issue no longer in candidate list, releasing claim", "issue_id", issueID)
 				o.State.ReleaseClaim(issueID)
 				continue
 			}
@@ -213,7 +303,7 @@ func (o *Orchestrator) processRetries(ctx context.Context, cfg config.Schema) {
 
 		// Check concurrency limits before re-dispatching.
 		if !o.canDispatch(cfg, entry.Issue) {
-			slog.Info("retry: no available slots, rescheduling", "issue", issueID)
+			slog.Info("retry: no available slots, rescheduling", "issue_id", issueID)
 			entry.Attempt++
 			entry.FireAt = time.Now().Add(failureRetryDelay(entry.Attempt, cfg))
 			o.State.SetRetry(issueID, entry)
@@ -244,11 +334,6 @@ func (o *Orchestrator) canDispatch(cfg config.Schema, issue tracker.Issue) bool 
 		return false
 	}
 
-	// Already completed?
-	if o.State.IsCompleted(issue.ID) {
-		return false
-	}
-
 	// Not in an active state?
 	if !isActiveState(issue.State, cfg.Tracker.ActiveStates) {
 		return false
@@ -276,6 +361,20 @@ func (o *Orchestrator) canDispatch(cfg config.Schema, issue tracker.Issue) bool 
 		}
 	}
 
+	// Per-host concurrency limit.
+	if cfg.Worker.MaxConcurrentAgentsPerHost > 0 && len(cfg.Worker.SSHHosts) > 0 {
+		hostCounts := o.State.RunningByHost()
+		allFull := true
+		for _, host := range cfg.Worker.SSHHosts {
+			if hostCounts[host] < cfg.Worker.MaxConcurrentAgentsPerHost {
+				allFull = false
+				break
+			}
+		}
+		if allFull {
+			return false
+		}
+	}
 	return true
 }
 
@@ -300,6 +399,17 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 
 	workerHost := o.selectWorkerHost(cfg)
 
+	// Set running with phase before workspace creation so the dashboard
+	// shows the issue immediately.
+	o.State.SetRunning(issue.ID, &RunInfo{
+		Issue:        issue,
+		WorkerHost:   workerHost,
+		Attempt:      attempt,
+		StartedAt:    time.Now(),
+		LastActivity: time.Now(),
+		Phase:        PhaseCreatingWorkspace,
+	})
+
 	runner := &agentrunner.Runner{
 		Agent:      o.Agent,
 		Tracker:    o.Tracker,
@@ -320,26 +430,24 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 		wsPath, createdNow, err = workspace.Create(ctx, cfg.Workspace.Root, issue.Identifier, cfg.Hooks.AfterCreate, hookTimeout)
 	}
 	if err != nil {
-		slog.Error("create workspace for dispatch", "issue", issue.ID, "error", err, "host", workerHost)
+		slog.Error("create workspace for dispatch", "issue_id", issue.ID, "error", err, "host", workerHost)
 		// Clean up if partially created remotely.
 		if workspace.IsRemote(workerHost) && wsPath != "" {
 			_ = workspace.RemoveRemote(ctx, sshCfg, wsPath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeout)
 		}
+		o.State.SetPhase(issue.ID, PhaseFailed)
+		o.State.RemoveRunning(issue.ID)
 		o.State.ReleaseClaim(issue.ID)
 		return
 	}
 
 	_ = createdNow // tracked for future hook optimization
 
-	info := &RunInfo{
-		Issue:         issue,
-		WorkerHost:    workerHost,
-		WorkspacePath: wsPath,
-		Attempt:       attempt,
-		StartedAt:     time.Now(),
-		LastActivity:  time.Now(),
+	// Update workspace path after creation.
+	if info := o.State.RunningIssue(issue.ID); info != nil {
+		info.WorkspacePath = wsPath
 	}
-	o.State.SetRunning(issue.ID, info)
+	o.State.SetPhase(issue.ID, PhaseStartingSession)
 
 	eventCh := make(chan agent.Event, 64)
 
@@ -355,17 +463,18 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 		}
 
 		if err != nil {
-			slog.Error("agent run failed", "issue", issue.ID, "error", err, "attempt", attempt)
+			slog.Error("agent run failed", "issue_id", issue.ID, "error", err, "attempt", attempt)
+			runInfo.Phase = PhaseFailed
 			o.scheduleRetry(issue.ID, runInfo, false, cfg)
-		o.addRuntime(runInfo)
-			o.State.UpdateLastError(issue.ID, err.Error())
+			o.addRuntime(runInfo)
 			return
 		}
 
 		if result.Completed {
 			o.State.MarkCompleted(issue.ID)
+			runInfo.Phase = PhaseSucceeded
 			o.addRuntime(runInfo)
-			slog.Info("agent run completed", "issue", issue.ID, "turns", result.TotalTurns)
+			slog.Info("agent run completed", "issue_id", issue.ID, "turns", result.TotalTurns)
 			// Check if issue is still active for continuation retry.
 			if o.Tracker != nil && isActiveState(issue.State, cfg.Tracker.ActiveStates) {
 				o.scheduleRetry(issue.ID, runInfo, true, cfg)
@@ -384,11 +493,12 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 	go func() {
 		for evt := range eventCh {
 			o.State.UpdateActivity(issue.ID)
+			o.State.SetPhase(issue.ID, PhaseRunningTurns)
 			if evt.Usage != nil {
 				o.State.UpdateUsage(issue.ID, *evt.Usage)
 			}
-		if evt.SessionID != "" {
-					o.State.UpdateSessionID(issue.ID, evt.SessionID)
+			if evt.SessionID != "" {
+				o.State.UpdateSessionID(issue.ID, evt.SessionID)
 			}
 			if evt.RateLimits != nil {
 				o.State.SetRateLimits(evt.RateLimits)
@@ -401,10 +511,13 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 }
 
 // scheduleRetry schedules a retry for an issue.
+// Continuation retries reset attempt to 1; failure retries increment attempt.
 func (o *Orchestrator) scheduleRetry(issueID string, info *RunInfo, isContinue bool, cfg config.Schema) {
-	attempt := info.Attempt
-	if !isContinue {
-		attempt++
+	var attempt int
+	if isContinue {
+		attempt = 1
+	} else {
+		attempt = info.Attempt + 1
 	}
 
 	var delay time.Duration
@@ -420,7 +533,7 @@ func (o *Orchestrator) scheduleRetry(issueID string, info *RunInfo, isContinue b
 		FireAt:     time.Now().Add(delay),
 		IsContinue: isContinue,
 	})
-	slog.Info("scheduled retry", "issue", issueID, "attempt", attempt, "delay", delay, "continuation", isContinue)
+	slog.Info("scheduled retry", "issue_id", issueID, "attempt", attempt, "delay", delay, "continuation", isContinue)
 }
 
 // failureRetryDelay computes exponential backoff for failure retries.
@@ -534,7 +647,7 @@ func hookTimeoutVal(cfg config.Schema) time.Duration {
 	if cfg.Hooks.TimeoutMS > 0 {
 		return time.Duration(cfg.Hooks.TimeoutMS) * time.Millisecond
 	}
-	return 5 * time.Minute
+	return 60 * time.Second
 }
 
 // trackerSanitizeKey is a simple key sanitizer for workspace paths.

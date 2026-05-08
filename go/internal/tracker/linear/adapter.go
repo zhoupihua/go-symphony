@@ -158,6 +158,7 @@ func normalizeIssues(raw []linearIssue) []tracker.Issue {
 			Priority:    ri.Priority,
 			State:       ri.State.Name,
 			URL:         ri.URL,
+			BranchName:  ri.BranchName,
 			Labels:      normalizeLabels(ri),
 			BlockedBy:   extractBlockedBy(ri),
 			CreatedAt:   parseTime(ri.CreatedAt),

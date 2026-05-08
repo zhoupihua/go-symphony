@@ -3,11 +3,19 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+)
+
+// Sentinel errors for workflow loading.
+var (
+	ErrMissingWorkflowFile = errors.New("workflow file not found")
+	ErrWorkflowParseError  = errors.New("workflow file parse error")
+	ErrFrontMatterNotMap   = errors.New("front matter must be a mapping")
 )
 
 // Load reads the file at path, parses optional YAML front matter delimited by
@@ -34,7 +42,7 @@ import (
 func Load(path string) (config map[string]any, prompt string, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, "", fmt.Errorf("read workflow file: %w", err)
+		return nil, "", fmt.Errorf("%w: %v", ErrMissingWorkflowFile, err)
 	}
 
 	content := string(data)
@@ -76,7 +84,7 @@ func Load(path string) (config map[string]any, prompt string, err error) {
 	// Parse front matter as YAML.
 	var raw any
 	if err := yaml.Unmarshal(fmBytes, &raw); err != nil {
-		return nil, "", fmt.Errorf("parse front matter YAML: %w", err)
+		return nil, "", fmt.Errorf("%w: %v", ErrWorkflowParseError, err)
 	}
 
 	// Empty front matter → empty config.
@@ -87,7 +95,7 @@ func Load(path string) (config map[string]any, prompt string, err error) {
 	// Front matter must be a map.
 	m, ok := raw.(map[string]any)
 	if !ok {
-		return nil, "", fmt.Errorf("front matter must be a mapping, got %T", raw)
+		return nil, "", fmt.Errorf("%w: got %T", ErrFrontMatterNotMap, raw)
 	}
 
 	return m, prompt, nil

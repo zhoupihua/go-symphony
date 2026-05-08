@@ -13,6 +13,12 @@ const (
 	EventApprovalAutoApproved EventType = "approval_auto_approved"
 	EventNotification         EventType = "notification"
 	EventUsageReport          EventType = "usage_report"
+	EventSessionStarted       EventType = "session_started"
+	EventStartupFailed        EventType = "startup_failed"
+	EventTurnEndedWithError   EventType = "turn_ended_with_error"
+	EventUnsupportedToolCall  EventType = "unsupported_tool_call"
+	EventOtherMessage         EventType = "other_message"
+	EventMalformed            EventType = "malformed"
 )
 
 // Event represents a single event emitted during an agent session.

@@ -377,8 +377,8 @@ func TestAgentConfigMapClaude(t *testing.T) {
 func TestHookTimeoutDefault(t *testing.T) {
 	cfg := config.Schema{}
 	d := hookTimeout(cfg)
-	if d != 5*time.Minute {
-		t.Errorf("hookTimeout = %v, want 5m", d)
+	if d != 60*time.Second {
+		t.Errorf("hookTimeout = %v, want 60s", d)
 	}
 }
 

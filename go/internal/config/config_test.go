@@ -76,7 +76,7 @@ func TestParse_AllFieldsSpecified(t *testing.T) {
 		},
 	}
 
-	s, err := Parse(raw)
+	s, err := Parse(raw, "")
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
@@ -112,9 +112,9 @@ func TestParse_AllFieldsSpecified(t *testing.T) {
 		t.Errorf("Polling.IntervalMS = %d, want 15000", s.Polling.IntervalMS)
 	}
 
-	// Workspace
-	if s.Workspace.Root != "/tmp/my_workspaces" {
-		t.Errorf("Workspace.Root = %q, want %q", s.Workspace.Root, "/tmp/my_workspaces")
+	// Workspace: absolute path from config preserved (platform-specific normalization)
+	if !filepath.IsAbs(s.Workspace.Root) {
+		t.Errorf("Workspace.Root = %q, want absolute path", s.Workspace.Root)
 	}
 
 	// Hooks
@@ -219,7 +219,7 @@ func TestParse_AllFieldsSpecified(t *testing.T) {
 func TestParse_EmptyConfig_AllDefaults(t *testing.T) {
 	raw := map[string]any{}
 
-	_, err := Parse(raw)
+	_, err := Parse(raw, "")
 	if err == nil {
 		t.Fatal("Parse() expected validation error for empty config, got nil")
 	}
@@ -244,7 +244,7 @@ func TestParse_PartialConfig(t *testing.T) {
 		},
 	}
 
-	s, err := Parse(raw)
+	s, err := Parse(raw, "")
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
@@ -270,6 +270,14 @@ func TestParse_PartialConfig(t *testing.T) {
 	if s.Tracker.Linear.Endpoint != "https://api.linear.app/graphql" {
 		t.Errorf("Tracker.Linear.Endpoint = %q, want default", s.Tracker.Linear.Endpoint)
 	}
+	wantActive := []string{"Todo", "In Progress"}
+	if len(s.Tracker.ActiveStates) != len(wantActive) {
+		t.Errorf("Tracker.ActiveStates = %v, want default %v", s.Tracker.ActiveStates, wantActive)
+	}
+	wantTerminal := []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"}
+	if len(s.Tracker.TerminalStates) != len(wantTerminal) {
+		t.Errorf("Tracker.TerminalStates = %v, want default %v", s.Tracker.TerminalStates, wantTerminal)
+	}
 	if s.Agent.MaxTurns != 20 {
 		t.Errorf("Agent.MaxTurns = %d, want 20 (default)", s.Agent.MaxTurns)
 	}
@@ -278,6 +286,9 @@ func TestParse_PartialConfig(t *testing.T) {
 	}
 	if s.Agent.Codex.ApprovalPolicy != "auto" {
 		t.Errorf("Agent.Codex.ApprovalPolicy = %q, want %q (default)", s.Agent.Codex.ApprovalPolicy, "auto")
+	}
+	if s.Agent.Codex.Command != "codex app-server" {
+		t.Errorf("Agent.Codex.Command = %q, want %q (default)", s.Agent.Codex.Command, "codex app-server")
 	}
 	if s.Agent.Claude.Command != "claude" {
 		t.Errorf("Agent.Claude.Command = %q, want %q (default)", s.Agent.Claude.Command, "claude")
@@ -315,7 +326,7 @@ func TestParse_WorkspaceRootTildeExpansion(t *testing.T) {
 		},
 	}
 
-	s, err := Parse(raw)
+	s, err := Parse(raw, "")
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
@@ -323,6 +334,104 @@ func TestParse_WorkspaceRootTildeExpansion(t *testing.T) {
 	want := filepath.Join(home, "symphony_ws")
 	if s.Workspace.Root != want {
 		t.Errorf("Workspace.Root = %q, want %q", s.Workspace.Root, want)
+	}
+}
+
+func TestParse_RelativeWorkspaceRoot(t *testing.T) {
+	raw := map[string]any{
+		"workspace": map[string]any{
+			"root": "workspaces",
+		},
+		"tracker": map[string]any{
+			"kind":    "linear",
+			"api_key": "test_key",
+			"linear": map[string]any{
+				"project_slug": "my-proj",
+			},
+		},
+		"agent": map[string]any{
+			"kind": "codex",
+		},
+	}
+
+	s, err := Parse(raw, "/project/myrepo")
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	// Relative path resolved against workflowDir
+	if !filepath.IsAbs(s.Workspace.Root) {
+		t.Errorf("Workspace.Root = %q, want absolute path after resolution", s.Workspace.Root)
+	}
+	if !strings.HasSuffix(filepath.ToSlash(s.Workspace.Root), "project/myrepo/workspaces") {
+		t.Errorf("Workspace.Root = %q, want suffix project/myrepo/workspaces", s.Workspace.Root)
+	}
+}
+
+func TestParse_DefaultActiveAndTerminalStates(t *testing.T) {
+	raw := map[string]any{
+		"tracker": map[string]any{
+			"kind":    "linear",
+			"api_key": "test_key",
+			"linear": map[string]any{
+				"project_slug": "my-proj",
+			},
+		},
+		"agent": map[string]any{
+			"kind": "codex",
+		},
+	}
+
+	s, err := Parse(raw, "")
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	wantActive := []string{"Todo", "In Progress"}
+	if len(s.Tracker.ActiveStates) != len(wantActive) {
+		t.Fatalf("Tracker.ActiveStates = %v, want %v", s.Tracker.ActiveStates, wantActive)
+	}
+	for i, v := range wantActive {
+		if s.Tracker.ActiveStates[i] != v {
+			t.Errorf("Tracker.ActiveStates[%d] = %q, want %q", i, s.Tracker.ActiveStates[i], v)
+		}
+	}
+
+	wantTerminal := []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"}
+	if len(s.Tracker.TerminalStates) != len(wantTerminal) {
+		t.Fatalf("Tracker.TerminalStates = %v, want %v", s.Tracker.TerminalStates, wantTerminal)
+	}
+	for i, v := range wantTerminal {
+		if s.Tracker.TerminalStates[i] != v {
+			t.Errorf("Tracker.TerminalStates[%d] = %q, want %q", i, s.Tracker.TerminalStates[i], v)
+		}
+	}
+}
+
+func TestParse_DefaultCodexTimeouts(t *testing.T) {
+	raw := map[string]any{
+		"tracker": map[string]any{
+			"kind":    "linear",
+			"api_key": "test_key",
+			"linear": map[string]any{
+				"project_slug": "my-proj",
+			},
+		},
+		"agent": map[string]any{
+			"kind": "codex",
+		},
+	}
+
+	s, err := Parse(raw, "")
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if s.Agent.Codex.TurnTimeoutMS != 3600000 {
+		t.Errorf("Agent.Codex.TurnTimeoutMS = %d, want 3600000 (1h default)", s.Agent.Codex.TurnTimeoutMS)
+	}
+	if s.Agent.Codex.ReadTimeoutMS != 5000 {
+		t.Errorf("Agent.Codex.ReadTimeoutMS = %d, want 5000 (5s default)", s.Agent.Codex.ReadTimeoutMS)
 	}
 }
 
@@ -377,7 +486,7 @@ func TestParse_AgentKindAutoDetect(t *testing.T) {
 			wantError: true,
 		},
 		{
-			name: "codex.command empty string does not auto-detect",
+			name: "codex.command empty string gets default and auto-detects",
 			raw: map[string]any{
 				"tracker": map[string]any{
 					"kind":    "linear",
@@ -392,14 +501,13 @@ func TestParse_AgentKindAutoDetect(t *testing.T) {
 					},
 				},
 			},
-			wantKind: "",
-			wantError: true,
+			wantKind: "codex",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.raw)
+			s, err := Parse(tt.raw, "")
 			if tt.wantError {
 				if err == nil {
 					t.Fatal("Parse() expected error, got nil")
@@ -417,14 +525,13 @@ func TestParse_AgentKindAutoDetect(t *testing.T) {
 }
 
 func TestParse_MissingRequiredFields_ValidationError(t *testing.T) {
-	// Missing tracker.kind and agent.kind should cause Parse to return a validation error.
 	raw := map[string]any{
 		"tracker": map[string]any{
 			"api_key": "some_key",
 		},
 	}
 
-	_, err := Parse(raw)
+	_, err := Parse(raw, "")
 	if err == nil {
 		t.Fatal("Parse() expected validation error for missing required fields, got nil")
 	}
@@ -561,6 +668,9 @@ func TestValidate(t *testing.T) {
 			},
 			Agent: AgentConfig{
 				Kind: "codex",
+				Codex: CodexConfig{
+					Command: "codex app-server",
+				},
 			},
 		}
 
@@ -581,7 +691,8 @@ func TestValidate(t *testing.T) {
 				},
 			},
 			Agent: AgentConfig{
-				Kind: "claude",
+				Kind:   "claude",
+				Claude: ClaudeConfig{Command: "claude"},
 			},
 		}
 
@@ -598,6 +709,9 @@ func TestValidate(t *testing.T) {
 			},
 			Agent: AgentConfig{
 				Kind: "codex",
+				Codex: CodexConfig{
+					Command: "codex app-server",
+				},
 			},
 		}
 
@@ -618,6 +732,9 @@ func TestValidate(t *testing.T) {
 			},
 			Agent: AgentConfig{
 				Kind: "codex",
+				Codex: CodexConfig{
+					Command: "codex app-server",
+				},
 			},
 		}
 
@@ -683,6 +800,9 @@ func TestValidate(t *testing.T) {
 			},
 			Agent: AgentConfig{
 				Kind: "codex",
+				Codex: CodexConfig{
+					Command: "codex app-server",
+				},
 			},
 		}
 
@@ -703,6 +823,9 @@ func TestValidate(t *testing.T) {
 			},
 			Agent: AgentConfig{
 				Kind: "codex",
+				Codex: CodexConfig{
+					Command: "codex app-server",
+				},
 			},
 		}
 
@@ -725,7 +848,8 @@ func TestValidate(t *testing.T) {
 				},
 			},
 			Agent: AgentConfig{
-				Kind: "claude",
+				Kind:   "claude",
+				Claude: ClaudeConfig{Command: "claude"},
 			},
 		}
 
@@ -748,7 +872,8 @@ func TestValidate(t *testing.T) {
 				},
 			},
 			Agent: AgentConfig{
-				Kind: "claude",
+				Kind:   "claude",
+				Claude: ClaudeConfig{Command: "claude"},
 			},
 		}
 
@@ -758,6 +883,56 @@ func TestValidate(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "tracker.plane.project_id") {
 			t.Errorf("error %q should mention tracker.plane.project_id", err.Error())
+		}
+	})
+
+	t.Run("codex without command", func(t *testing.T) {
+		s := &Schema{
+			Tracker: TrackerConfig{
+				Kind:   "linear",
+				APIKey: "some_key",
+				Linear: LinearConfig{
+					ProjectSlug: "my-project",
+				},
+			},
+			Agent: AgentConfig{
+				Kind: "codex",
+				Codex: CodexConfig{
+					Command: "",
+				},
+			},
+		}
+
+		err := Validate(s)
+		if err == nil {
+			t.Fatal("Validate() expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "agent.codex.command") {
+			t.Errorf("error %q should mention agent.codex.command", err.Error())
+		}
+	})
+
+	t.Run("claude without command", func(t *testing.T) {
+		s := &Schema{
+			Tracker: TrackerConfig{
+				Kind:   "linear",
+				APIKey: "some_key",
+				Linear: LinearConfig{
+					ProjectSlug: "my-project",
+				},
+			},
+			Agent: AgentConfig{
+				Kind:   "claude",
+				Claude: ClaudeConfig{Command: ""},
+			},
+		}
+
+		err := Validate(s)
+		if err == nil {
+			t.Fatal("Validate() expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "agent.claude.command") {
+			t.Errorf("error %q should mention agent.claude.command", err.Error())
 		}
 	})
 

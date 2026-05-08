@@ -53,7 +53,7 @@ func TestLoad(t *testing.T) {
 			name:        "invalid YAML in front matter",
 			content:     "---\n[invalid: yaml: stuff\n---\nprompt\n",
 			wantErr:     true,
-			errContains: "parse front matter YAML",
+			errContains: "workflow file parse error",
 		},
 		{
 			name:        "front matter is a list not a map",

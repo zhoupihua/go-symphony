@@ -43,15 +43,16 @@ type planeState struct {
 
 // planeIssue represents an issue object from Plane's API.
 type planeIssue struct {
-	ID             string   `json:"id"`
-	SequenceID     int      `json:"sequence_id"`
-	Name           string   `json:"name"`
-	DescriptionHTML string  `json:"description_html"`
-	State          string   `json:"state"`
-	Priority       int      `json:"priority"`
-	Labels         []string `json:"labels"`
-	CreatedAt      string   `json:"created_at"`
-	UpdatedAt      string   `json:"updated_at"`
+	ID              string   `json:"id"`
+	SequenceID      int      `json:"sequence_id"`
+	Name            string   `json:"name"`
+	DescriptionHTML string   `json:"description_html"`
+	State           string   `json:"state"`
+	Priority        int      `json:"priority"`
+	Labels          []string `json:"labels"`
+	BranchName      string   `json:"branch_name"`
+	CreatedAt       string   `json:"created_at"`
+	UpdatedAt       string   `json:"updated_at"`
 }
 
 // Get sends a GET request to the given path (relative to baseURL).

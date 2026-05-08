@@ -15,6 +15,18 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+// errorResponse is a JSON error envelope for API responses.
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+// writeJSONError writes a JSON error response with the given status code.
+func writeJSONError(w http.ResponseWriter, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(errorResponse{Error: message})
+}
+
 // stateResponse is the JSON response for the /api/v1/state endpoint.
 type stateResponse struct {
 	Leader             bool                   `json:"leader"`
@@ -35,9 +47,11 @@ type runInfoJSON struct {
 	State         string   `json:"state"`
 	Labels        []string `json:"labels"`
 	URL           string   `json:"url"`
+	BranchName    string   `json:"branch_name"`
 	WorkerHost    string   `json:"worker_host"`
 	WorkspacePath string   `json:"workspace_path"`
 	Attempt       int      `json:"attempt"`
+	Phase         string   `json:"phase"`
 	StartedAt     string   `json:"started_at"`
 	LastActivity  string   `json:"last_activity"`
 	TurnCount     int      `json:"turn_count"`
@@ -71,7 +85,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	identifier := r.PathValue("identifier")
 	if identifier == "" {
-		http.Error(w, "missing identifier", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "missing identifier")
 		return
 	}
 
@@ -90,9 +104,11 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 				State:         info.Issue.State,
 				Labels:        labels,
 				URL:           info.Issue.URL,
+				BranchName:    info.Issue.BranchName,
 				WorkerHost:    info.WorkerHost,
 				WorkspacePath: info.WorkspacePath,
 				Attempt:       info.Attempt,
+				Phase:         info.Phase,
 				StartedAt:     info.StartedAt.Format(time.RFC3339),
 				LastActivity:  info.LastActivity.Format(time.RFC3339),
 				TurnCount:     info.TurnCount,
@@ -108,7 +124,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	http.Error(w, "issue not found", http.StatusNotFound)
+	writeJSONError(w, http.StatusNotFound, "issue not found")
 }
 
 // refreshResponse is the JSON response for the /api/v1/refresh endpoint.
@@ -138,7 +154,7 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
 
@@ -203,9 +219,11 @@ func (s *Server) buildStateResponse() stateResponse {
 			State:         info.Issue.State,
 			Labels:        labels,
 			URL:           info.Issue.URL,
+			BranchName:    info.Issue.BranchName,
 			WorkerHost:    info.WorkerHost,
 			WorkspacePath: info.WorkspacePath,
 			Attempt:       info.Attempt,
+			Phase:         info.Phase,
 			StartedAt:     info.StartedAt.Format(time.RFC3339),
 			LastActivity:  info.LastActivity.Format(time.RFC3339),
 			TurnCount:     info.TurnCount,

@@ -19,6 +19,7 @@ type Issue struct {
 	Priority    *int         // nil if not set
 	Labels      []string
 	URL         string
+	BranchName  string       // Git branch name associated with the issue
 	BlockedBy   []BlockerRef // Issues blocking this one
 	CreatedAt   time.Time
 	UpdatedAt   time.Time

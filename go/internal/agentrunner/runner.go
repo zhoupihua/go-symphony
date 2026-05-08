@@ -61,6 +61,9 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 	if err != nil {
 		return RunResult{}, fmt.Errorf("render prompt: %w", err)
 	}
+	if strings.TrimSpace(promptText) == "" {
+		promptText = "You are working on an issue from Linear."
+	}
 
 	// 3. Start agent session.
 	sess, err := r.Agent.StartSession(ctx, agent.SessionOptions{
@@ -197,7 +200,7 @@ func hookTimeout(cfg config.Schema) time.Duration {
 	if cfg.Hooks.TimeoutMS > 0 {
 		return time.Duration(cfg.Hooks.TimeoutMS) * time.Millisecond
 	}
-	return 5 * time.Minute
+	return 60 * time.Second
 }
 
 // agentConfigMap converts the relevant agent config into a map for SessionOptions.Config.

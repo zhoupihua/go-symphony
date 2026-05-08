@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -154,7 +155,11 @@ func loadAndParse(path string) (*config.Schema, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	cfg, err := config.Parse(raw)
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		absPath = path
+	}
+	cfg, err := config.Parse(raw, filepath.Dir(absPath))
 	if err != nil {
 		return nil, "", err
 	}

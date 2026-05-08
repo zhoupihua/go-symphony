@@ -225,6 +225,7 @@ func (a *Adapter) normalizeIssue(pi planeIssue) tracker.Issue {
 		Priority:    priority,
 		Labels:      labels,
 		URL:         url,
+		BranchName:  pi.BranchName,
 		CreatedAt:   createdAt,
 		UpdatedAt:   updatedAt,
 	}

@@ -12,8 +12,9 @@ import (
 )
 
 // Parse parses a raw config map (from workflow.Load) into a typed Schema,
-// applying defaults for any zero-valued fields.
-func Parse(raw map[string]any) (*Schema, error) {
+// applying defaults for any zero-valued fields. workflowDir is used to resolve
+// relative workspace.root paths against the directory containing WORKFLOW.md.
+func Parse(raw map[string]any, workflowDir string) (*Schema, error) {
 	// 1. Marshal the map back to YAML bytes
 	data, err := yaml.Marshal(raw)
 	if err != nil {
@@ -29,29 +30,54 @@ func Parse(raw map[string]any) (*Schema, error) {
 	// 3. Apply defaults for any zero-valued fields
 	applyDefaults(&s)
 
-	// 4. Resolve $VAR environment variable references
+	// 4. Resolve relative workspace.root against workflowDir
+	if s.Workspace.Root != "" && !filepath.IsAbs(s.Workspace.Root) && !strings.HasPrefix(s.Workspace.Root, "~/") {
+		s.Workspace.Root = filepath.Join(workflowDir, s.Workspace.Root)
+	}
+	// Normalize workspace root to absolute path
+	if s.Workspace.Root != "" && !filepath.IsAbs(s.Workspace.Root) {
+		abs, err := filepath.Abs(s.Workspace.Root)
+		if err == nil {
+			s.Workspace.Root = abs
+		}
+	}
+
+	// 5. Resolve $VAR environment variable references
 	if err := resolveEnvVars(&s); err != nil {
 		return nil, fmt.Errorf("resolve env vars: %w", err)
 	}
 
-	// 5. Validate required fields
+	// 6. Validate required fields
 	if err := Validate(&s); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
 
-	// 6. Return schema
+	// 7. Return schema
 	return &s, nil
 }
 
 // applyDefaults sets default values for zero-valued fields.
 func applyDefaults(s *Schema) {
-	// Linear endpoint default
+	// Tracker defaults
+	if s.Tracker.Kind == "linear" && s.Tracker.Linear.Endpoint == "" {
+		s.Tracker.Linear.Endpoint = "https://api.linear.app/graphql"
+	}
+	if s.Tracker.Kind == "plane" && s.Tracker.Plane.Endpoint == "" {
+		s.Tracker.Plane.Endpoint = "https://api.plane.so/api/"
+	}
+	// Keep endpoint defaults even when kind not set yet (for validation messages)
 	if s.Tracker.Linear.Endpoint == "" {
 		s.Tracker.Linear.Endpoint = "https://api.linear.app/graphql"
 	}
-	// Plane endpoint default
 	if s.Tracker.Plane.Endpoint == "" {
 		s.Tracker.Plane.Endpoint = "https://api.plane.so/api/"
+	}
+	// Active and terminal states defaults per SPEC 6.4
+	if len(s.Tracker.ActiveStates) == 0 {
+		s.Tracker.ActiveStates = []string{"Todo", "In Progress"}
+	}
+	if len(s.Tracker.TerminalStates) == 0 {
+		s.Tracker.TerminalStates = []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"}
 	}
 	// Polling interval default
 	if s.Polling.IntervalMS == 0 {
@@ -84,19 +110,24 @@ func applyDefaults(s *Schema) {
 	if len(s.Agent.MaxConcurrentByState) > 0 {
 		normalized := make(map[string]int, len(s.Agent.MaxConcurrentByState))
 		for k, v := range s.Agent.MaxConcurrentByState {
-			normalized[strings.ToLower(k)] = v
+			if v > 0 {
+				normalized[strings.ToLower(k)] = v
+			}
 		}
 		s.Agent.MaxConcurrentByState = normalized
 	}
 	// Codex defaults
+	if s.Agent.Codex.Command == "" {
+		s.Agent.Codex.Command = "codex app-server"
+	}
 	if s.Agent.Codex.ApprovalPolicy == "" {
 		s.Agent.Codex.ApprovalPolicy = "auto"
 	}
 	if s.Agent.Codex.TurnTimeoutMS == 0 {
-		s.Agent.Codex.TurnTimeoutMS = 300000
+		s.Agent.Codex.TurnTimeoutMS = 3600000
 	}
 	if s.Agent.Codex.ReadTimeoutMS == 0 {
-		s.Agent.Codex.ReadTimeoutMS = 30000
+		s.Agent.Codex.ReadTimeoutMS = 5000
 	}
 	if s.Agent.Codex.StallTimeoutMS == 0 {
 		s.Agent.Codex.StallTimeoutMS = 300000
@@ -210,6 +241,14 @@ func Validate(s *Schema) error {
 		if s.Tracker.Plane.ProjectID == "" {
 			errs = append(errs, fmt.Errorf("tracker.plane.project_id is required when tracker.kind is \"plane\""))
 		}
+	}
+
+	// Agent command must be non-empty
+	if s.Agent.Kind == "codex" && s.Agent.Codex.Command == "" {
+		errs = append(errs, fmt.Errorf("agent.codex.command is required when agent.kind is \"codex\""))
+	}
+	if s.Agent.Kind == "claude" && s.Agent.Claude.Command == "" {
+		errs = append(errs, fmt.Errorf("agent.claude.command is required when agent.kind is \"claude\""))
 	}
 
 	return errors.Join(errs...)
