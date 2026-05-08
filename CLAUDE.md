@@ -14,7 +14,7 @@ symphony/
 │   ├── test/            # ExUnit tests
 │   ├── WORKFLOW.md      # In-repo workflow contract
 │   └── AGENTS.md        # Elixir-specific AI agent instructions
-├── go/                  # Go-zero implementation (in progress)
+├── go/                  # Go native implementation (in progress)
 │   └── README.md
 └── docs/                # Documentation
 ```
@@ -32,50 +32,67 @@ Key points:
 
 ## Go Implementation
 
-Go-zero implementation of Symphony, referencing the Elixir implementation and conforming to SPEC.md.
+Native Go implementation of Symphony as a long-running daemon, referencing the Elixir implementation and conforming to SPEC.md.
 
-### go-zero AI Context
+### Architecture
 
-Go-zero AI tools are installed as submodules:
-- `.claude/ai-context/` — workflow-level context (instructions, patterns, tools, workflows)
-- `.claude/skills/zero-skills/` — knowledge-level context (detailed patterns, references, troubleshooting)
+Configuration-driven composition (V5):
+- Core interfaces: `Tracker`, `Agent`/`Session`, `Elector`
+- Adapters selected by WORKFLOW.md config (`tracker.kind`, `agent.kind`)
+- Execution mode: local `os/exec` or SSH remote, selected by `worker.ssh_hosts`
+- HA: `LocalElector` (single instance, no deps) or `EtcdElector` (etcd-based leader election)
 
-When working in `go/`, follow the spec-first development flow defined in `.claude/ai-context/00-instructions.md`:
-1. Write `.api` or `.proto` spec first
-2. Generate code with `goctl`
-3. Fill in business logic
-4. Run post-generation steps: `go mod tidy` → verify imports → `go build ./...`
+### Six Abstraction Layers
 
-### go-zero Conventions
+| Layer | Go Package | Responsibility |
+|-------|-----------|---------------|
+| Policy | `workflow`, `workflowstore` | WORKFLOW.md loading, file watching, prompt template |
+| Configuration | `config` | Typed getters, defaults, $VAR resolution |
+| Coordination | `orchestrator` | Poll loop, dispatch, reconcile, retry |
+| Execution | `workspace`, `agentrunner` | Workspace lifecycle, agent subprocess management |
+| Integration | `tracker` (interface), `linear`, `plane` | Issue tracker API adapters |
+| Observability | `httpserver`, `ha` | Dashboard, SSE, health, leader election |
 
-- Context first: `func(ctx context.Context, req *types.Request)`
-- Errors: `errorx.NewCodeError(code, msg)`
-- Config: `json:",default=value"`
-- Validation: `validate:"required"`
-- Always generate README.md for new services
+### Go Conventions
 
-## Architecture
+- Standard library first; avoid heavy frameworks
+- Context propagation: `func(ctx context.Context, ...)`
+- Errors: `fmt.Errorf("...: %w", err)` with error wrapping
+- Config: struct with env tags, sensible defaults
+- Logging: structured logging via `log/slog`
+- Long-running loops use `context.Context` for cancellation
+- Adapters register explicitly (no `init()`)
 
-Symphony has six abstraction layers (per SPEC.md §3.2):
+### Supported Trackers
 
-| Layer | Responsibility |
-|-------|---------------|
-| Policy | Repo-defined workflow (`WORKFLOW.md` prompt + rules) |
-| Configuration | Typed getters, defaults, env resolution |
-| Coordination | Polling loop, concurrency, retries, reconciliation |
-| Execution | Workspace lifecycle, agent subprocess management |
-| Integration | Issue tracker API adapter (Linear) |
-| Observability | Structured logs, status dashboard |
+| Tracker | `tracker.kind` | API Style |
+|---------|---------------|-----------|
+| Linear | `"linear"` | GraphQL |
+| Plane | `"plane"` | REST |
 
-The Elixir implementation maps these to:
-- Policy → `Workflow`, `WorkflowStore`
-- Configuration → `Config`, `Config.Schema`
-- Coordination → `Orchestrator` (GenServer)
-- Execution → `Workspace`, `AgentRunner`, `Codex.AppServer`
-- Integration → `Tracker` (behaviour), `Linear.Adapter`
-- Observability → `LogFile`, `StatusDashboard`, `HttpServer`
+### Supported Agents
 
-The Go implementation should follow the same layering. Each layer should be a separate package with clear interfaces.
+| Agent | `agent.kind` | Protocol | SSH Support |
+|-------|-------------|----------|-------------|
+| Codex | `"codex"` | JSON-RPC 2.0 over stdio (persistent session) | Persistent SSH session |
+| Claude Code | `"claude"` | NDJSON stream over stdout (per-turn subprocess) | Per-turn SSH command |
+
+### Deployment Modes
+
+| Mode | ha.enabled | worker.ssh_hosts | etcd |
+|------|-----------|-----------------|------|
+| Local single | false | empty | no |
+| Cloud single | false | empty | no |
+| Cloud + SSH workers | false | configured | no |
+| Cloud HA | true | empty | yes |
+| Cloud HA + SSH | true | configured | yes |
+
+### Dashboard
+
+- Web UI: templ + htmx + SSE (real-time updates, no JS framework)
+- Leader: serves dashboard with live orchestrator state
+- Standby: redirects to leader's dashboard
+- API: `/api/v1/state`, `/api/v1/refresh`, `/api/v1/events` (SSE), `/healthz`
 
 ## Cross-Implementation Rules
 

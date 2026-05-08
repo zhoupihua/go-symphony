@@ -8,8 +8,10 @@
 4. Codex uses bidirectional JSON-RPC 2.0 over stdio; Claude Code uses one-shot `claude -p` subprocess
 5. The orchestrator is the single authority for dispatch decisions (per SPEC.md §7)
 6. Target scale: up to 10 concurrent agents by default (configurable)
-7. Single binary for all deployment modes; etcd only needed in HA mode
-8. Dashboard uses SSE for real-time updates (server → client), htmx for DOM updates, templ for type-safe HTML
+7. Deployment: single binary; single-instance needs zero external deps, HA needs etcd
+8. Agent execution: local subprocess, SSH remote subprocess, or API call — selected by config
+9. All agents are CLI-based (Codex, Claude Code); future API-based agents (Devin, OpenHands) extend the same interface
+10. One instance per project; multi-project supported by running multiple instances with different WORKFLOW.md configs
 
 ## Requirements
 
@@ -94,22 +96,22 @@ WHEN an agent session completes normally THEN it reports completion with token u
 WHEN an agent session fails THEN it reports the error category for retry decision
 - **TEST** `TestAgent_SessionFails`
 
-#### Agent Routing
+#### Agent Execution Modes
 
-WHEN an issue has a label with `agent:` prefix (e.g., `agent:claude`) THEN the specified agent adapter is used
-- **TEST** `TestAgentRouting_LabelOverride`
+WHEN `worker.ssh_hosts` is not configured THEN agents run as local subprocesses via `os/exec`
+- **TEST** `TestAgent_LocalExecution`
 
-WHEN an issue is assigned to a user in `agent.assignee_map` THEN the mapped agent adapter is used
-- **TEST** `TestAgentRouting_AssigneeMap`
+WHEN `worker.ssh_hosts` is configured THEN agents run on remote hosts via SSH
+- **TEST** `TestAgent_SSHExecution`
 
-WHEN an issue has no agent label and the assignee is not in `assignee_map` THEN the default `agent.kind` is used
-- **TEST** `TestAgentRouting_DefaultFallback`
+WHEN a Codex agent runs over SSH THEN it maintains a persistent SSH session with bidirectional JSON-RPC
+- **TEST** `TestCodex_SSHSession`
 
-WHEN agent routing resolves to an unknown agent kind THEN the dispatch fails with a clear error
-- **TEST** `TestAgentRouting_UnknownKindFails`
+WHEN a Claude Code agent runs over SSH THEN each turn opens a new SSH command invocation
+- **TEST** `TestClaude_SSHTurnInvocation`
 
-WHEN multiple routing rules match (label + assignee) THEN label takes priority over assignee map
-- **TEST** `TestAgentRouting_LabelOverridesAssignee`
+WHEN `worker.ssh_hosts` has multiple hosts THEN the orchestrator selects the least-loaded host
+- **TEST** `TestWorkerHost_Selection`
 
 #### Codex Adapter
 
@@ -136,36 +138,53 @@ WHEN Claude Code streams NDJSON output THEN the adapter parses events and report
 WHEN a Claude Code invocation completes THEN the adapter reports result and starts a new invocation for continuation if issue is still active
 - **TEST** `TestClaude_Continuation`
 
-WHEN Claude Code needs approval THEN `--dangerously-skip-permissions` or `--allowedTools` flags control behavior
+WHEN Claude Code runs in auto mode THEN `--dangerously-skip-permissions` or `--allowedTools` flags control approval behavior
 - **TEST** `TestClaude_ApprovalFlags`
 
-#### HA — Leader Election
+#### HA (High Availability)
 
-WHEN `ha.enabled` is false or absent THEN the daemon uses `LocalElector` (always leader, no external dependencies)
-- **TEST** `TestHA_LocalElectorAlwaysLeader`
+WHEN `ha.enabled` is false or not configured THEN `LocalElector` is used; the daemon is always leader, no external dependencies
+- **TEST** `TestHA_LocalElector`
 
-WHEN `ha.enabled` is true THEN the daemon connects to etcd and campaigns for leadership
-- **TEST** `TestHA_EtcdElectorCampaign`
+WHEN `ha.enabled` is true THEN `EtcdElector` campaigns for leadership via etcd
+- **TEST** `TestHA_EtcdElector`
 
-WHEN an instance holds leadership and etcd lease expires THEN the instance steps down and stops orchestrating
-- **TEST** `TestHA_LeaseLostStopsOrchestrating`
+WHEN the daemon loses leadership THEN the orchestrator stops dispatching and existing agents are terminated gracefully
+- **TEST** `TestHA_LeadershipLost`
 
-WHEN the leader process crashes THEN a standby instance acquires leadership via etcd campaign
-- **TEST** `TestHA_FailoverOnLeaderCrash`
+WHEN a standby instance gains leadership THEN it performs startup cleanup (terminal workspace removal) and begins polling
+- **TEST** `TestHA_Failover`
 
-WHEN the leader resigns gracefully THEN it stops active agents and releases the etcd lease
-- **TEST** `TestHA_GracefulResign`
+WHEN `ha.enabled` is true and etcd is unreachable THEN the daemon fails startup with a clear error
+- **TEST** `TestHA_EtcdUnreachable`
 
-WHEN `ha.enabled` is true but etcd is unreachable THEN the daemon fails startup with a clear error
-- **TEST** `TestHA_EtcdUnreachableFails`
+#### Dashboard
+
+WHEN the HTTP server is enabled THEN the Web UI dashboard is accessible at `/`
+- **TEST** `TestDashboard_WebUI`
+
+WHEN the dashboard loads THEN it shows running agents, retry queue, token usage, and rate limits
+- **TEST** `TestDashboard_Content`
+
+WHEN the orchestrator state changes THEN the dashboard receives real-time updates via SSE
+- **TEST** `TestDashboard_SSEUpdates`
+
+WHEN a standby instance's dashboard is accessed THEN it redirects to the leader's dashboard
+- **TEST** `TestDashboard_StandbyRedirect`
+
+WHEN `/api/v1/state` is requested THEN JSON with running, retrying, codex_totals, rate_limits is returned
+- **TEST** `TestHTTP_StateEndpoint`
+
+WHEN `POST /api/v1/refresh` is called THEN an immediate poll is triggered
+- **TEST** `TestHTTP_RefreshEndpoint`
+
+WHEN `/healthz` is requested THEN 200 is returned if alive
+- **TEST** `TestHTTP_HealthEndpoint`
 
 #### Orchestrator (SPEC.md §7, §8)
 
-WHEN the daemon starts THEN it validates config, cleans up terminal workspaces, and schedules an immediate poll tick
+WHEN the daemon starts THEN it campaigns for leadership, validates config, cleans up terminal workspaces, and schedules an immediate poll tick
 - **TEST** `TestOrchestrator_Startup`
-
-WHEN the daemon is a standby (not leader) THEN the orchestrator does not poll, dispatch, or reconcile
-- **TEST** `TestOrchestrator_StandbyDoesNothing`
 
 WHEN a poll tick fires THEN the orchestrator reconciles running issues, validates dispatch preflight, fetches candidates, and dispatches eligible issues
 - **TEST** `TestOrchestrator_PollTick`
@@ -202,6 +221,9 @@ WHEN an agent finishes THEN `after_run` hook runs regardless of outcome; failure
 WHEN the workspace path escapes the workspace root THEN the operation is rejected
 - **TEST** `TestWorkspace_PathSafety`
 
+WHEN a worker host is configured THEN workspace operations (create, remove, hooks) execute on the remote host via SSH
+- **TEST** `TestWorkspace_SSHOperations`
+
 #### Prompt (SPEC.md §12)
 
 WHEN rendering a prompt THEN the template is rendered with issue variables; unknown variables cause an error
@@ -209,51 +231,6 @@ WHEN rendering a prompt THEN the template is rendered with issue variables; unkn
 
 WHEN prompt rendering fails THEN the run attempt fails and the orchestrator decides retry
 - **TEST** `TestPrompt_RenderFailure`
-
-#### Dashboard — Web UI
-
-WHEN the HTTP server is enabled THEN the dashboard is served at `/` with real-time updates via SSE
-- **TEST** `TestDashboard_ServedAtRoot`
-
-WHEN the orchestrator state changes THEN an SSE event is pushed to connected dashboard clients
-- **TEST** `TestDashboard_SSEPush`
-
-WHEN a dashboard client connects THEN it receives the current state immediately
-- **TEST** `TestDashboard_InitialStateOnConnect`
-
-WHEN the dashboard shows running agents THEN it displays issue identifier, turn count, token usage, and duration
-- **TEST** `TestDashboard_RunningAgentsDisplay`
-
-WHEN the dashboard shows the retry queue THEN it displays issue identifier, attempt number, and retry countdown
-- **TEST** `TestDashboard_RetryQueueDisplay`
-
-#### Dashboard — API Endpoints
-
-WHEN `GET /api/v1/state` is requested THEN it returns JSON with running, retrying, codex_totals, rate_limits
-- **TEST** `TestHTTP_StateEndpoint`
-
-WHEN `GET /api/v1/<issue_identifier>` is requested THEN it returns issue-specific runtime details
-- **TEST** `TestHTTP_IssueEndpoint`
-
-WHEN `POST /api/v1/refresh` is requested THEN it triggers an immediate poll
-- **TEST** `TestHTTP_RefreshEndpoint`
-
-WHEN `/healthz` is requested THEN the daemon responds with 200 if alive
-- **TEST** `TestHTTP_HealthEndpoint`
-
-#### Dashboard — Multi-Instance HA
-
-WHEN a standby instance receives a dashboard request THEN it redirects to the leader's HTTP address
-- **TEST** `TestDashboard_StandbyRedirectsToLeader`
-
-WHEN a standby instance receives `/healthz` THEN it responds with 200 (health check works on all instances)
-- **TEST** `TestDashboard_StandbyHealthCheck`
-
-WHEN a standby instance receives `/api/v1/state` THEN it proxies or redirects to the leader
-- **TEST** `TestDashboard_StandbyAPISRedirect`
-
-WHEN the leader fails over THEN SSE clients reconnect to the new leader after a brief interruption
-- **TEST** `TestDashboard_FailoverReconnect`
 
 #### Observability (SPEC.md §13)
 
@@ -268,32 +245,23 @@ WHEN running in a container THEN `slog` outputs JSON to stdout for log aggregati
 WHEN SIGTERM is received THEN the daemon gracefully stops active agents and exits
 - **TEST** `TestGracefulShutdown`
 
-WHEN `SYMPHONY_LOG_FORMAT=json` is set THEN slog uses JSON handler regardless of other config
-- **TEST** `TestLogging_EnvVarOverride`
-
 ### Commands
 
 ```bash
 # Build
 cd go && go build -o symphony ./cmd/symphony
 
-# Run (single-instance)
+# Run (single instance, no etcd)
 ./symphony --workflow path/to/WORKFLOW.md
 
-# Run (HA mode — etcd required)
-./symphony --workflow path/to/WORKFLOW.md
-
-# Run with explicit port
-./symphony --workflow path/to/WORKFLOW.md --port 8080
+# Run (HA mode, etcd required)
+./symphony --workflow path/to/WORKFLOW.md  # ha.enabled: true in WORKFLOW.md
 
 # Test
 go test ./...
 
 # Test with coverage
 go test -cover ./...
-
-# Integration tests (require real API keys)
-go test -tags=integration ./...
 
 # Lint
 go vet ./...
@@ -311,88 +279,86 @@ go generate ./...
 go/
 ├── cmd/
 │   └── symphony/
-│       └── main.go                  # CLI entrypoint, signal handling
+│       └── main.go                    # CLI entrypoint
 ├── internal/
 │   ├── workflow/
-│   │   ├── workflow.go              # WORKFLOW.md loader (YAML front matter + prompt body)
-│   │   ├── store.go                 # File watcher with last-known-good cache
+│   │   ├── workflow.go                # WORKFLOW.md loader (YAML front matter + prompt body)
+│   │   ├── store.go                   # File watcher with last-known-good cache
 │   │   └── workflow_test.go
 │   ├── config/
-│   │   ├── config.go                # Typed getters, defaults, $VAR resolution
-│   │   ├── schema.go                # Config struct definitions
+│   │   ├── config.go                  # Typed getters, defaults, $VAR resolution
+│   │   ├── schema.go                  # Config struct definitions
 │   │   └── config_test.go
 │   ├── orchestrator/
-│   │   ├── orchestrator.go          # Poll loop, dispatch, reconcile, retry
-│   │   ├── state.go                 # Runtime state (running, claimed, retry_attempts)
+│   │   ├── orchestrator.go            # Poll loop, dispatch, reconcile, retry
+│   │   ├── state.go                   # Runtime state (running, claimed, retry_attempts)
 │   │   └── orchestrator_test.go
 │   ├── tracker/
-│   │   ├── tracker.go               # Tracker interface definition
-│   │   ├── issue.go                 # Normalized Issue struct
-│   │   ├── registry.go              # Adapter registry (name -> factory)
+│   │   ├── tracker.go                 # Tracker interface definition
+│   │   ├── issue.go                   # Normalized Issue struct
+│   │   ├── registry.go                # Adapter registry (name -> factory)
 │   │   ├── memory/
-│   │   │   ├── adapter.go           # In-memory adapter for testing
+│   │   │   ├── adapter.go             # In-memory adapter for testing
 │   │   │   └── adapter_test.go
 │   │   ├── linear/
-│   │   │   ├── adapter.go           # Linear GraphQL adapter
-│   │   │   ├── client.go            # GraphQL HTTP client
+│   │   │   ├── adapter.go             # Linear GraphQL adapter
+│   │   │   ├── client.go              # GraphQL HTTP client
 │   │   │   ├── adapter_test.go
 │   │   │   └── client_test.go
 │   │   └── plane/
-│   │       ├── adapter.go           # Plane REST adapter
-│   │       ├── client.go            # REST HTTP client
+│   │       ├── adapter.go             # Plane REST adapter
+│   │       ├── client.go              # REST HTTP client
 │   │       ├── adapter_test.go
 │   │       └── client_test.go
 │   ├── agent/
-│   │   ├── agent.go                 # Agent interface definition
-│   │   ├── event.go                 # Event types (TurnCompleted, TurnFailed, etc.)
-│   │   ├── registry.go              # Adapter registry (name -> factory)
+│   │   ├── agent.go                   # Agent + Session interface definitions
+│   │   ├── event.go                   # Event types (TurnCompleted, TurnFailed, etc.)
+│   │   ├── registry.go                # Adapter registry (name -> factory)
 │   │   ├── codex/
-│   │   │   ├── adapter.go           # Codex app-server adapter (JSON-RPC 2.0)
-│   │   │   ├── protocol.go          # JSON-RPC 2.0 protocol types
-│   │   │   ├── approval.go          # Auto-approval logic
-│   │   │   ├── dynamictool.go       # Client-side tool handler (linear_graphql, plane_rest)
+│   │   │   ├── adapter.go             # Codex app-server adapter (JSON-RPC 2.0)
+│   │   │   ├── protocol.go            # JSON-RPC 2.0 protocol types
+│   │   │   ├── approval.go            # Auto-approval logic
+│   │   │   ├── dynamictool.go         # Client-side tool handler (linear_graphql, plane_rest)
 │   │   │   ├── adapter_test.go
 │   │   │   └── protocol_test.go
 │   │   └── claude/
-│   │       ├── adapter.go           # Claude Code adapter (one-shot subprocess per turn)
-│   │       ├── stream.go            # NDJSON stream parser
+│   │       ├── adapter.go             # Claude Code adapter (one-shot subprocess per turn)
+│   │       ├── stream.go              # NDJSON stream parser
 │   │       ├── adapter_test.go
 │   │       └── stream_test.go
-│   ├── ha/
-│   │   ├── elector.go               # Elector interface definition
-│   │   ├── local.go                 # LocalElector — always leader, no deps
-│   │   ├── etcd.go                  # EtcdElector — etcd leader election
-│   │   ├── elector_test.go
-│   │   └── etcd_test.go
 │   ├── workspace/
-│   │   ├── workspace.go             # Workspace create/remove, hooks, path safety
-│   │   ├── pathsafety.go            # Symlink-aware canonical path resolution
+│   │   ├── workspace.go               # Workspace create/remove, hooks, path safety
+│   │   ├── pathsafety.go              # Symlink-aware canonical path resolution
+│   │   ├── remote.go                  # SSH remote workspace operations
 │   │   └── workspace_test.go
 │   ├── prompt/
-│   │   ├── prompt.go                # Template rendering with issue variables
+│   │   ├── prompt.go                  # Template rendering with issue variables
 │   │   └── prompt_test.go
 │   ├── agentrunner/
-│   │   ├── runner.go                # Orchestrates workspace + prompt + agent session
+│   │   ├── runner.go                  # Orchestrates workspace + prompt + agent session
 │   │   └── runner_test.go
-│   └── dashboard/
-│       ├── server.go                # HTTP server setup
-│       ├── handlers.go              # API handlers (/api/v1/state, /api/v1/refresh, /healthz)
-│       ├── sse.go                   # SSE event broker (fan-out to connected clients)
-│       ├── middleware.go             # Leader redirect middleware for HA
-│       ├── templ.go                 # Generated templ output
-│       ├── components/
-│       │   ├── layout.templ         # HTML layout shell
-│       │   ├── dashboard.templ      # Main dashboard page
-│       │   ├── running.templ        # Running agents panel
-│       │   ├── retry.templ          # Retry queue panel
-│       │   └── stats.templ          # Token stats panel
-│       ├── static/
-│       │   └── htmx.min.js          # Embedded htmx (via go:embed)
-│       ├── server_test.go
-│       └── sse_test.go
+│   ├── ha/
+│   │   ├── elector.go                 # Elector interface
+│   │   ├── local.go                   # LocalElector (single instance, no deps)
+│   │   ├── etcd.go                    # EtcdElector (multi-instance HA)
+│   │   ├── elector_test.go
+│   │   └── etcd_test.go
+│   ├── httpserver/
+│   │   ├── server.go                  # HTTP server setup
+│   │   ├── api.go                     # /api/v1/state, /api/v1/refresh, /api/v1/:id
+│   │   ├── dashboard.go               # Dashboard HTML via templ
+│   │   ├── sse.go                     # SSE endpoint for real-time updates
+│   │   ├── health.go                  # /healthz
+│   │   ├── static/                    # Embedded static assets (CSS, JS)
+│   │   ├── templ.go                   # Generated templ output
+│   │   ├── dashboard_templ.go         # templ template definitions
+│   │   └── server_test.go
+│   └── ssh/
+│       ├── client.go                  # SSH client wrapper
+│       └── client_test.go
 ├── docs/
-│   ├── SPEC.md                      # Copy of root SPEC.md (immutable reference)
-│   └── SPEC-GO.md                   # Go-specific extensions beyond SPEC.md
+│   ├── SPEC.md                        # Copy of root SPEC.md (immutable reference)
+│   └── SPEC-GO.md                     # Go-specific extensions beyond SPEC.md
 ├── go.mod
 ├── go.sum
 ├── Makefile
@@ -402,32 +368,7 @@ go/
 ### Code Style
 
 ```go
-// Elector interface — single vs HA
-type Elector interface {
-    Campaign(ctx context.Context) error
-    IsLeader() bool
-    Resign()
-    Done() <-chan struct{}
-    LeaderAddr() string
-}
-
-// LocalElector — single instance, zero external deps
-type LocalElector struct{ addr string }
-func (e *LocalElector) Campaign(_ context.Context) error { return nil }
-func (e *LocalElector) IsLeader() bool                   { return true }
-func (e *LocalElector) Resign()                          {}
-func (e *LocalElector) Done() <-chan struct{}             { return neverCloseCh }
-func (e *LocalElector) LeaderAddr() string               { return e.addr }
-
-// EtcdElector — HA mode via etcd
-type EtcdElector struct { client, lease, key, addr string }
-func (e *EtcdElector) Campaign(ctx context.Context) error { /* etcd campaign */ }
-func (e *EtcdElector) IsLeader() bool                     { /* check lease */ }
-func (e *EtcdElector) Resign()                            { /* revoke lease */ }
-func (e *EtcdElector) Done() <-chan struct{}              { /* lease lost channel */ }
-func (e *EtcdElector) LeaderAddr() string                 { /* read from etcd key */ }
-
-// Tracker interface — pluggable adapters
+// Core interfaces — adapters implement these
 type Tracker interface {
     FetchCandidateIssues(ctx context.Context) ([]Issue, error)
     FetchIssuesByStates(ctx context.Context, states []string) ([]Issue, error)
@@ -436,7 +377,6 @@ type Tracker interface {
     UpdateIssueState(ctx context.Context, issueID, state string) error
 }
 
-// Agent/Session interface — pluggable adapters
 type Agent interface {
     StartSession(ctx context.Context, opts SessionOptions) (Session, error)
 }
@@ -446,7 +386,34 @@ type Session interface {
     Close() error
 }
 
-// Orchestrator depends only on interfaces
+type Elector interface {
+    Campaign(ctx context.Context) error
+    IsLeader() bool
+    Resign()
+    Done() <-chan struct{}
+    LeaderAddr() string
+}
+
+// SessionOptions carries agent + execution config
+type SessionOptions struct {
+    WorkspacePath string
+    WorkerHost    string   // "" = local os/exec, non-empty = SSH
+    ApprovalPolicy string
+    SandboxPolicy  string
+    MaxTurns       int
+    DynamicTools   []ToolSpec
+}
+
+// Error wrapping with context
+func (a *LinearAdapter) FetchCandidateIssues(ctx context.Context) ([]Issue, error) {
+    resp, err := a.client.Query(ctx, candidateQuery, vars)
+    if err != nil {
+        return nil, fmt.Errorf("linear: fetch candidates: %w", err)
+    }
+    // ...
+}
+
+// Orchestrator uses Elector — single or HA is transparent
 func (o *Orchestrator) Run(ctx context.Context) error {
     if err := o.elector.Campaign(ctx); err != nil {
         return fmt.Errorf("campaign: %w", err)
@@ -469,21 +436,83 @@ func (o *Orchestrator) Run(ctx context.Context) error {
     }
 }
 
-// Dashboard SSE broker — pushes orchestrator state to browser
-type SSEBroker struct {
-    subscribers map[chan []byte]struct{}
-    mu          sync.Mutex
-}
-
-// Error wrapping
-func (a *LinearAdapter) FetchCandidateIssues(ctx context.Context) ([]Issue, error) {
-    resp, err := a.client.Query(ctx, candidateQuery, vars)
-    if err != nil {
-        return nil, fmt.Errorf("linear: fetch candidates: %w", err)
+// Dashboard: standby redirects to leader
+func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    if !h.elector.IsLeader() {
+        leader := h.elector.LeaderAddr()
+        http.Redirect(w, r, "http://"+leader+"/", 307)
+        return
     }
-    // ...
+    // Render dashboard with orchestrator state
 }
 ```
+
+### Configuration Schema (WORKFLOW.md extensions)
+
+```yaml
+# Base SPEC.md config (unchanged)
+tracker:
+  kind: linear                    # "linear" or "plane"
+  api_key: $LINEAR_API_KEY
+  active_states: ["Todo", "In Progress"]
+  terminal_states: ["Done", "Cancelled"]
+  # Linear-specific
+  linear:
+    project_slug: "my-project"
+    endpoint: "https://api.linear.app/graphql"  # default
+  # Plane-specific
+  plane:
+    workspace_slug: "my-team"
+    project_id: "uuid-here"
+    endpoint: "https://api.plane.so/api/"       # default
+
+# Agent selection (SPEC-GO extension)
+agent:
+  kind: codex                     # "codex" or "claude"
+  codex:
+    command: "codex app-server"
+    approval_policy: "never"
+  claude:
+    command: "claude"
+    permission_mode: "fullAuto"   # default for non-interactive
+
+# Worker hosts (SPEC.md Appendix A)
+worker:
+  ssh_hosts:
+    - host: worker1.example.com:22
+      max_concurrent_agents: 5
+    - host: worker2.example.com:22
+      max_concurrent_agents: 5
+
+# HA configuration (SPEC-GO extension)
+ha:
+  enabled: false                  # true = etcd leader election required
+  etcd_endpoints: ["http://etcd:2379"]
+  lease_ttl_ms: 10000
+  advertise_addr: "symphony-1:8080"  # this instance's HTTP address (for leader discovery)
+
+# Existing SPEC.md config
+polling:
+  interval_ms: 30000
+workspace:
+  root: ~/symphony_workspaces
+hooks:
+  after_create: "..."
+  before_run: "..."
+  after_run: "..."
+  before_remove: "..."
+  timeout_ms: 60000
+```
+
+### Deployment Modes
+
+| Mode | ha.enabled | worker.ssh_hosts | etcd | Notes |
+|------|-----------|-----------------|------|-------|
+| Local single | false | empty | no | Everything on one machine |
+| Cloud single | false | empty | no | Same as local, on a cloud VM |
+| Cloud + SSH workers | false | configured | no | Orchestrator on cloud, agents on SSH hosts |
+| Cloud HA | true | empty | yes | Active-standby, agents on same machine |
+| Cloud HA + SSH | true | configured | yes | Full distributed: HA + remote workers |
 
 ### Testing Strategy
 
@@ -491,68 +520,73 @@ func (a *LinearAdapter) FetchCandidateIssues(ctx context.Context) ([]Issue, erro
 - **Test locations**: `*_test.go` alongside source files
 - **Coverage target**: >= 80% for new code; 100% for interface contracts, path safety, and elector logic
 - **Test levels**:
-  - **Unit**: Each adapter independently with mocked HTTP servers (`httptest`); `LocalElector` for orchestrator tests
-  - **HA**: `EtcdElector` tests with embedded etcd (`go.etcd.io/etcd/tests/v3`) or mocked etcd client
+  - **Unit**: Each adapter independently with mocked HTTP servers (`httptest`) and mocked SSH
   - **Integration**: Tracker adapters against real API (optional, tagged `//go:build integration`)
-  - **End-to-end**: Orchestrator with in-memory tracker + mock agent + `LocalElector`
-  - **Dashboard**: `httptest` server with SSE client; verify real-time updates
+  - **End-to-end**: Orchestrator with in-memory tracker + mock agent
+  - **HA**: EtcdElector with etcd test container
 - **Mocking**: Hand-written mocks implementing Tracker/Agent/Elector interfaces; no mockgen
 
 ### Boundaries
 
-- **Always**: Use context.Context as first param; wrap errors with `fmt.Errorf`; log with `slog`; sanitize workspace paths; validate config at startup; check `elector.IsLeader()` before dispatch
+- **Always**: Use context.Context as first param; wrap errors with `fmt.Errorf`; log with `slog`; sanitize workspace paths; validate config at startup
 - **Ask first**: Adding new dependencies beyond stdlib; changing Tracker/Agent/Elector interfaces; modifying SPEC.md conformance behavior
-- **Never**: Run agent commands in the source repo; log secrets/API keys; use `init()` for adapter registration (explicit registration only); modify root SPEC.md; connect to etcd in single-instance mode
+- **Never**: Run agent commands in the source repo; log secrets/API keys; use `init()` for adapter registration (explicit registration only); modify root SPEC.md
 
 ## Decisions
 
-**Decision:** Use Go interfaces + explicit registry for adapter selection — **Rationale:** Go has no inheritance; interfaces are satisfied implicitly. A registry (`map[string]FactoryFunc`) lets WORKFLOW.md `tracker.kind`/`agent.kind` select adapters at startup without import side effects. Explicit is better than `init()` magic.
+**Decision:** Pure Go, no frameworks — **Rationale:** Symphony is a polling daemon, not a request-response service. stdlib + selective deps (etcd client, templ) covers all needs. No framework overhead.
 
-**Decision:** Codex adapter uses persistent JSON-RPC session; Claude Code adapter uses per-turn subprocess — **Rationale:** These are fundamentally different protocols. The Agent/Session interface abstracts this: Codex's `RunTurn` reuses the same subprocess; Claude Code's `RunTurn` spawns a new one. The orchestrator sees the same interface either way.
+**Decision:** Go interfaces + explicit registry for adapter selection — **Rationale:** Go interfaces are satisfied implicitly. A registry (`map[string]FactoryFunc`) lets WORKFLOW.md `tracker.kind`/`agent.kind` select adapters at startup without import side effects. Explicit is better than `init()` magic.
 
-**Decision:** Dynamic tools are adapter-specific — **Rationale:** Codex supports `dynamicTools` in its JSON-RPC protocol. Claude Code has no equivalent. The Codex adapter handles `linear_graphql` and `plane_rest` as dynamic tools. The Claude Code adapter injects equivalent tool access via system prompt instructions. This keeps the Agent interface clean.
+**Decision:** Codex uses persistent JSON-RPC session; Claude Code uses per-turn subprocess — **Rationale:** Fundamentally different protocols. The Agent/Session interface abstracts this: Codex's `RunTurn` reuses the same subprocess/connection; Claude Code's `RunTurn` spawns a new one. Orchestrator sees the same interface.
 
-**Decision:** `agent.kind` is a new WORKFLOW.md front-matter key — **Rationale:** SPEC.md only defines `tracker.kind` and `codex.*` config. Adding `agent.kind` with values `"codex"` or `"claude"` lets the config select the agent adapter. For backwards compatibility, if `agent.kind` is absent but `codex.command` is present, default to `"codex"`.
+**Decision:** Execution mode (local vs SSH) is orthogonal to agent type — **Rationale:** Both Codex and Claude Code support local `os/exec` and SSH remote execution. The `SessionOptions.WorkerHost` field selects the mode. Agent adapters handle both internally; the interface doesn't change.
 
-**Decision:** Agent routing uses 3-tier priority: label > assignee map > default — **Rationale:** In team collaboration, different developers prefer different agents. Issue label `agent:xxx` provides per-issue override (highest priority). `agent.assignee_map` maps assignee IDs to agent kinds for per-developer preference. `agent.kind` is the fallback default. This covers team collaboration without requiring AI-based selection.
+**Decision:** SSH Worker is Phase 1, not Phase 2 — **Rationale:** Cloud separated deployment requires SSH for CLI-based agents. Without it, cloud deployment can only be single-machine. SSH is essential for real-world cloud use.
 
-**Decision:** Tracker-specific config is nested under `tracker.<kind>.*` — **Rationale:** Each tracker needs different config keys (Linear: `project_slug`; Plane: `workspace_slug`, `project_id`). The pattern is: `tracker.kind` selects the adapter, then `tracker.linear.*` or `tracker.plane.*` provides adapter-specific config. Only the active tracker's config section is validated.
+**Decision:** Dynamic tools are agent-specific — **Rationale:** Codex supports `dynamicTools` in JSON-RPC protocol. Claude Code has no equivalent. Codex adapter handles `linear_graphql` and `plane_rest` as dynamic tools. Claude Code adapter injects equivalent access via system prompt or `--allowedTools`. This keeps the Agent interface clean.
 
-**Decision:** `Elector` interface abstracts leadership; `LocalElector` for single-instance, `EtcdElector` for HA — **Rationale:** Single-instance deployment must not require etcd. The Elector interface lets the orchestrator code be identical for both modes. `LocalElector` always returns `IsLeader()=true` and never connects to any external service. `EtcdElector` uses etcd campaign + lease for leader election.
+**Decision:** `agent.kind` is a new WORKFLOW.md front-matter key — **Rationale:** SPEC.md only defines `tracker.kind` and `codex.*` config. Adding `agent.kind` with values `"codex"` or `"claude"` lets the config select the agent adapter. Backwards compatible: if `agent.kind` is absent but `codex.command` is present, default to `"codex"`.
 
-**Decision:** Standby instances redirect dashboard/API requests to leader — **Rationale:** Only the leader has orchestrator state. Rather than replicating state to standbys (adds complexity and latency), standbys simply redirect HTTP requests to the leader's address (obtained from etcd). `/healthz` still works on all instances for K8s health checks.
+**Decision:** Tracker-specific config nested under `tracker.<kind>.*` — **Rationale:** Each tracker needs different keys. `tracker.kind` selects the adapter; `tracker.linear.*` or `tracker.plane.*` provides adapter-specific config. Only the active tracker's config is validated.
 
-**Decision:** Dashboard uses templ + htmx + SSE — **Rationale:** templ provides type-safe, compile-checked HTML templates in Go. htmx enables dynamic DOM updates without a JS framework. SSE provides real-time server→client push. All three are pure Go (no npm, no build step). Single binary includes all static assets via `go:embed`.
+**Decision:** Elector interface with LocalElector + EtcdElector — **Rationale:** Single-instance needs zero external deps (LocalElector always leader). HA uses etcd for leader election (EtcdElector). Config selects implementation. Same binary works for both.
 
-**Decision:** slog with JSON handler for cloud, text handler for local — **Rationale:** Single logging interface. `SYMPHONY_LOG_FORMAT=json` env var switches to JSON. Default is text (human-readable for local development).
+**Decision:** Standby dashboard redirects to leader — **Rationale:** Only the leader has orchestrator state. Standby instances redirect HTTP requests to the leader's address (obtained from Elector.LeaderAddr()). /healthz works on all instances. No state sync needed.
 
-**Decision:** HTTP server with `net/http` from stdlib — **Rationale:** The observability API + dashboard + SSE has ~5 endpoints. No framework needed. `net/http` is sufficient and has zero dependencies.
+**Decision:** Dashboard uses templ + htmx + SSE — **Rationale:** templ for type-safe Go HTML templates, htmx for declarative DOM updates, SSE for real-time server→client push. No JS framework, no build step, single binary via go:embed.
+
+**Decision:** slog with configurable format — **Rationale:** `SYMPHONY_LOG_FORMAT=json` for cloud (container log aggregation), default text for local. Single logging interface.
+
+**Decision:** HTTP server with `net/http` — **Rationale:** 5 endpoints (dashboard, state, refresh, health, SSE). No framework needed. stdlib is sufficient.
+
+**Decision:** One instance per project; multi-project via multiple instances — **Rationale:** Simpler orchestrator state (no project-scoped concurrency tracking). Each instance gets its own WORKFLOW.md, tracker connection, and workspace root. Multiple instances managed externally (systemd, K8s). Future: `projects` array in WORKFLOW.md for single-instance multi-project (interface design will accommodate).
 
 ## Risks
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Agent interface cannot cleanly abstract Codex bidirectional vs Claude Code one-shot protocols | High | Design the interface around `Session` + `RunTurn` where each implementation manages its own subprocess lifecycle. Validate with both adapters before building orchestrator. |
-| Plane REST API pagination or filtering differs from assumed behavior | Medium | Write Plane adapter integration tests early. Read Plane API docs carefully. Use `httptest` for unit tests against recorded responses. |
-| Claude Code `stream-json` format changes or is undocumented | Medium | Pin minimum Claude Code version in docs. Write stream parser defensively with unknown-field tolerance. |
-| etcd lease expiry causes false leader loss under network partition | High | Set lease TTL generously (default 10s). Use etcd `WithRequireLeader` for campaign. Log leadership transitions at WARN level. |
-| Config schema becomes too complex with tracker-specific, agent-specific, and HA sections | Medium | Keep config flat: `tracker.kind` selects tracker sub-config, `agent.kind` selects agent sub-config, `ha.enabled` selects elector. Only active sections are validated. |
-| Adding future agents (Devin, Aider, OpenHands) reveals interface gaps | High | Design the Agent interface with extension points: `SessionOptions` is a struct, not positional args. New fields can be added without breaking existing adapters. |
-| SSE connections accumulate on leader under many dashboard clients | Low | Set reasonable keepalive interval. Drop stale connections on ping timeout. Dashboard is for operators, not high-traffic. |
-| Performance at max concurrency (10 agents, each with subprocess + HTTP polling) | Low | Go handles this easily. Profile only if issues arise. |
+| Agent interface cannot cleanly abstract Codex bidirectional vs Claude Code one-shot | High | Session + RunTurn model validated against both adapters. Codex reuses connection, Claude creates new one per turn. |
+| SSH remote execution has latency/reliability issues | Medium | Codex maintains persistent SSH session. Claude Code per-turn SSH adds overhead but is simpler. Both tested with network simulation. |
+| Plane REST API pagination/filtering differs from assumed | Medium | Write Plane adapter integration tests early. Use httptest for unit tests against recorded responses. |
+| Claude Code `stream-json` format changes or is undocumented | Medium | Pin minimum Claude Code version. Write stream parser defensively with unknown-field tolerance. |
+| etcd client dependency bloats binary | Low | etcd client is ~5MB compiled. Only linked when ha.enabled=true at runtime. Acceptable for a server binary. |
+| Adding future agents (Devin, OpenHands) reveals interface gaps | High | SessionOptions is a struct, not positional args. New fields added without breaking existing adapters. API-based agents get a new adapter implementing the same interface. |
+| Dashboard SSE doesn't work behind some proxies | Medium | Document proxy configuration (disable buffering for SSE). Fallback: dashboard auto-polls if SSE disconnects. |
 
 ## SPEC-GO Extensions (beyond SPEC.md)
 
-These are Go-specific extensions documented in `go/docs/SPEC-GO.md`:
+Documented in `go/docs/SPEC-GO.md`:
 
-1. **`agent.kind` config key** — values: `"codex"`, `"claude"`. Defaults to `"codex"` for backwards compatibility.
-2. **`agent.assignee_map` config key** — maps assignee identifiers to agent kinds (e.g., `{"zhang-san": "claude", "li-si": "codex"}`). Enables per-developer agent preference in team collaboration.
-2. **Plane tracker adapter** — `tracker.kind: "plane"` with Plane-specific config.
-3. **`tracker.plane.*` config section** — `workspace_slug` (required), `project_id` (required, UUID), `api_key` (required, or `$VAR`), `endpoint` (default `https://api.plane.so/api/`).
-4. **`ha.*` config section** — `enabled` (default `false`), `etcd_endpoints` (required when enabled), `lease_ttl_ms` (default `10000`), `advertise_addr` (required when enabled, HTTP address for dashboard redirect).
+1. **`agent.kind` config key** — values: `"codex"`, `"claude"`. Defaults to `"codex"` when `codex.command` is present.
+2. **`agent.claude.*` config section** — `command` (default `"claude"`), `permission_mode` (default `"fullAuto"`), `allowed_tools`, `max_turns`.
+3. **Plane tracker adapter** — `tracker.kind: "plane"` with `tracker.plane.*` config.
+4. **`ha.*` config section** — `enabled`, `etcd_endpoints`, `lease_ttl_ms`, `advertise_addr`.
 5. **`SYMPHONY_LOG_FORMAT` env var** — `"json"` or `"text"` (default `"text"`).
-6. **`/healthz` endpoint** — always available when HTTP server is running, even on standbys.
-7. **Graceful shutdown** — SIGTERM/SIGINT triggers context cancellation; agents receive shutdown signal.
-8. **Web UI dashboard** — templ + htmx + SSE at `/`. Real-time updates without page refresh.
-9. **Agent adapter registry** — extensible via code, not config; new agents implement the interface and register.
-10. **Standby redirect** — non-leader instances redirect dashboard and API requests to the leader's `advertise_addr`.
+6. **`/healthz` endpoint** — always available when HTTP server is running.
+7. **Graceful shutdown** — SIGTERM/SIGINT triggers context cancellation.
+8. **Web UI dashboard** — templ + htmx + SSE at `/`.
+9. **SSE endpoint** — `/api/v1/events` for real-time state updates.
+10. **Agent adapter registry** — extensible via code; new agents implement the interface and register.
+11. **SSH remote execution** — `worker.ssh_hosts` config enables remote agent execution and workspace management.
+12. **Multi-project** — one instance per project; multi-project by running multiple instances with different WORKFLOW.md. Future enhancement: `projects` array in WORKFLOW.md for single-instance multi-project.
