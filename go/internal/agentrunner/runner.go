@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/ainative/go-symphony/internal/agent"
 	"github.com/ainative/go-symphony/internal/config"
 	"github.com/ainative/go-symphony/internal/prompt"
+	"github.com/ainative/go-symphony/internal/sshclient"
 	"github.com/ainative/go-symphony/internal/tracker"
 	"github.com/ainative/go-symphony/internal/workspace"
 )
@@ -25,39 +27,45 @@ type RunResult struct {
 // Runner orchestrates the full agent lifecycle for a single issue:
 // create workspace, run hooks, render prompt, start session, run turns, clean up.
 type Runner struct {
-	Agent    agent.Agent
-	Tracker  tracker.Tracker
-	Cfg      config.Schema
-	Tmpl     string // prompt template from workflow
+	Agent      agent.Agent
+	Tracker    tracker.Tracker
+	Cfg        config.Schema
+	Tmpl       string // prompt template from workflow
+	WorkerHost string // empty for local, SSH host for remote
 }
 
 // Run executes the full agent lifecycle for the given issue.
 // It sends events to eventCh for observability and returns the final result.
 func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, eventCh chan<- agent.Event) (RunResult, error) {
-	// 1. Create workspace.
-	hookTimeout := hookTimeout(r.Cfg)
-	wsPath, created, err := workspace.Create(ctx, r.Cfg.Workspace.Root, issue.Identifier, r.Cfg.Hooks.AfterCreate, hookTimeout)
-	if err != nil {
-		return RunResult{}, fmt.Errorf("create workspace: %w", err)
-	}
-	slog.Info("workspace ready", "path", wsPath, "created", created, "issue", issue.Identifier)
+	// Derive workspace path from config root + sanitized key.
+	wsRoot := r.Cfg.Workspace.Root
+	sanitizedKey := SanitizeKey(issue.Identifier)
+	wsPath := wsRoot + "/" + sanitizedKey
 
-	// 2. Run before_run hook.
+	// 1. Run before_run hook.
+	hookTimeout := hookTimeout(r.Cfg)
 	if r.Cfg.Hooks.BeforeRun != "" {
-		if err := workspace.RunHook(ctx, r.Cfg.Hooks.BeforeRun, wsPath, hookTimeout); err != nil {
-			return RunResult{}, fmt.Errorf("before_run hook failed: %w", err)
+		if workspace.IsRemote(r.WorkerHost) {
+			if err := workspace.RunHookRemote(ctx, sshConfigFromHost(r.WorkerHost), r.Cfg.Hooks.BeforeRun, wsPath, hookTimeout); err != nil {
+				return RunResult{}, fmt.Errorf("before_run hook failed: %w", err)
+			}
+		} else {
+			if err := workspace.RunHook(ctx, r.Cfg.Hooks.BeforeRun, wsPath, hookTimeout); err != nil {
+				return RunResult{}, fmt.Errorf("before_run hook failed: %w", err)
+			}
 		}
 	}
 
-	// 3. Render prompt.
+	// 2. Render prompt.
 	promptText, err := prompt.Render(r.Tmpl, issue, attempt)
 	if err != nil {
 		return RunResult{}, fmt.Errorf("render prompt: %w", err)
 	}
 
-	// 4. Start agent session.
+	// 3. Start agent session.
 	sess, err := r.Agent.StartSession(ctx, agent.SessionOptions{
 		WorkspacePath: wsPath,
+		WorkerHost:    r.WorkerHost,
 		Tracker:       r.Tracker,
 		Issue:         issue,
 		Config:        agentConfigMap(r.Cfg),
@@ -67,7 +75,7 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 	}
 	defer sess.Close()
 
-	// 5. Turn loop.
+	// 4. Turn loop.
 	maxTurns := r.Cfg.Agent.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = 10
@@ -77,7 +85,6 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 	currentPrompt := promptText
 
 	for result.TotalTurns < maxTurns {
-		// Check context.
 		select {
 		case <-ctx.Done():
 			return result, fmt.Errorf("run cancelled: %w", ctx.Err())
@@ -98,7 +105,14 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 		result.TotalUsage.OutputTokens += turnResult.Usage.OutputTokens
 		result.TotalUsage.TotalTokens += turnResult.Usage.TotalTokens
 
-		sendEvent(eventCh, agent.EventTurnCompleted, issue.ID, turnResult.Output, &turnResult.Usage)
+		var eventOpts []func(*agent.Event)
+		if turnResult.SessionID != "" {
+			eventOpts = append(eventOpts, withSessionID(turnResult.SessionID))
+		}
+		if turnResult.RateLimits != nil {
+			eventOpts = append(eventOpts, withRateLimits(turnResult.RateLimits))
+		}
+		sendEvent(eventCh, agent.EventTurnCompleted, issue.ID, turnResult.Output, &turnResult.Usage, eventOpts...)
 
 		if turnResult.Completed {
 			result.Completed = true
@@ -118,18 +132,46 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 			}
 		}
 
-		// Build continuation prompt for next turn.
 		currentPrompt = fmt.Sprintf("Continue working on the issue. Turn %d of %d.", result.TotalTurns+1, maxTurns)
 	}
 
-	// 6. Run after_run hook (failure is logged, not blocking).
+	// 5. Run after_run hook (failure is logged, not blocking).
 	if r.Cfg.Hooks.AfterRun != "" {
-		if err := workspace.RunHook(ctx, r.Cfg.Hooks.AfterRun, wsPath, hookTimeout); err != nil {
-			slog.Warn("after_run hook failed", "error", err, "path", wsPath)
+		if workspace.IsRemote(r.WorkerHost) {
+			if err := workspace.RunHookRemote(ctx, sshConfigFromHost(r.WorkerHost), r.Cfg.Hooks.AfterRun, wsPath, hookTimeout); err != nil {
+				slog.Warn("after_run hook failed", "error", err, "path", wsPath)
+			}
+		} else {
+			if err := workspace.RunHook(ctx, r.Cfg.Hooks.AfterRun, wsPath, hookTimeout); err != nil {
+				slog.Warn("after_run hook failed", "error", err, "path", wsPath)
+			}
 		}
 	}
 
 	return result, nil
+}
+
+// SanitizeKey is a local wrapper for tracker key sanitization.
+func SanitizeKey(s string) string {
+	var b []byte
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			b = append(b, byte(r))
+		} else {
+			b = append(b, '_')
+		}
+	}
+	return string(b)
+}
+
+// sshConfigFromHost parses a "host:port" string into an sshclient.Config.
+func sshConfigFromHost(host string) sshclient.Config {
+	sshCfg := sshclient.Config{Host: host}
+	if idx := strings.LastIndex(host, ":"); idx > 0 {
+		sshCfg.Host = host[:idx]
+		sshCfg.Port = 0 // ParseInt not needed; sshclient handles default
+	}
+	return sshCfg
 }
 
 // issueStillActive checks whether the issue is still in an active state.
@@ -201,19 +243,33 @@ func agentConfigMap(cfg config.Schema) map[string]any {
 }
 
 // sendEvent sends an event to the channel without blocking.
-func sendEvent(ch chan<- agent.Event, typ agent.EventType, issueID, msg string, usage *agent.UsageReport) {
+func sendEvent(ch chan<- agent.Event, typ agent.EventType, issueID, msg string, usage *agent.UsageReport, opts ...func(*agent.Event)) {
 	if ch == nil {
 		return
 	}
-	select {
-	case ch <- agent.Event{
+	evt := agent.Event{
 		Type:      typ,
 		IssueID:   issueID,
 		Message:   msg,
 		Usage:     usage,
 		Timestamp: time.Now(),
-	}:
+	}
+	for _, opt := range opts {
+		opt(&evt)
+	}
+	select {
+	case ch <- evt:
 	default:
 		// Drop event if channel is full.
 	}
+}
+
+// withSessionID returns an event option that sets the session ID.
+func withSessionID(sid string) func(*agent.Event) {
+	return func(e *agent.Event) { e.SessionID = sid }
+}
+
+// withRateLimits returns an event option that sets the rate limits.
+func withRateLimits(limits map[string]any) func(*agent.Event) {
+	return func(e *agent.Event) { e.RateLimits = limits }
 }

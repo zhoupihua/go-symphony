@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/exec"
 	"time"
 
 	"github.com/ainative/go-symphony/internal/agent"
+	"github.com/ainative/go-symphony/internal/sshclient"
 	"github.com/ainative/go-symphony/internal/tracker"
 )
 
@@ -67,7 +69,17 @@ func Register() {
 
 // StartSession spawns a codex subprocess, performs the initialize and thread/start
 // handshake, and returns an active CodexSession.
+// When opts.WorkerHost is set, it creates a persistent SSH session for bidirectional
+// JSON-RPC. Otherwise, it runs locally via os/exec.
 func (a *CodexAdapter) StartSession(ctx context.Context, opts agent.SessionOptions) (agent.Session, error) {
+	if opts.WorkerHost != "" {
+		return a.startSSHSession(ctx, opts)
+	}
+	return a.startLocalSession(ctx, opts)
+}
+
+// startLocalSession spawns a local codex subprocess.
+func (a *CodexAdapter) startLocalSession(ctx context.Context, opts agent.SessionOptions) (agent.Session, error) {
 	// 1. Spawn subprocess.
 	cmd := exec.CommandContext(ctx, "bash", "-lc", a.command)
 	cmd.Dir = opts.WorkspacePath
@@ -196,6 +208,166 @@ func (a *CodexAdapter) StartSession(ctx context.Context, opts agent.SessionOptio
 	return sess, nil
 }
 
+// startSSHSession creates a persistent SSH session for remote Codex execution.
+// It dials the SSH host, starts the codex app-server remotely, and pipes
+// stdin/stdout for bidirectional JSON-RPC over the SSH connection.
+func (a *CodexAdapter) startSSHSession(ctx context.Context, opts agent.SessionOptions) (agent.Session, error) {
+	sshCfg := sshclient.Config{
+		Host: opts.WorkerHost,
+	}
+	sshCl := sshclient.New(sshCfg)
+
+	sshConn, err := sshCl.Dial(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("codex ssh: dial: %w", err)
+	}
+
+	slog.Info("codex ssh: connected to worker", "host", opts.WorkerHost)
+
+	// Start the codex app-server over SSH.
+	session, err := sshConn.NewSession()
+	if err != nil {
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: new session: %w", err)
+	}
+
+	stdinPipe, err := session.StdinPipe()
+	if err != nil {
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: stdin pipe: %w", err)
+	}
+	stdoutPipe, err := session.StdoutPipe()
+	if err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: stdout pipe: %w", err)
+	}
+
+	// Build the remote command with workspace directory.
+	remoteCmd := sshclient.BuildCommand(a.command, opts.WorkspacePath)
+	if err := session.Start(remoteCmd); err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: start remote process: %w", err)
+	}
+
+	enc := NewEncoder(stdinPipe)
+	dec := NewDecoder(stdoutPipe)
+
+	// Perform the same initialize/initialized/thread/start handshake.
+	initReq, err := Request(1, MethodInitialize, InitializeParams{
+		Capabilities: map[string]any{},
+		ClientInfo:   ClientInfo{Name: "symphony", Version: "0.1.0"},
+	})
+	if err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: build initialize request: %w", err)
+	}
+	if err := enc.Encode(initReq); err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: send initialize request: %w", err)
+	}
+
+	initResp, err := decodeWithTimeout(dec, a.readTimeout)
+	if err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: read initialize response: %w", err)
+	}
+	if initResp.Error != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: initialize failed: %s", initResp.Error.Message)
+	}
+
+	initNotif, err := Notification(MethodInitialized, InitializedParams{})
+	if err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: build initialized notification: %w", err)
+	}
+	if err := enc.Encode(initNotif); err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: send initialized notification: %w", err)
+	}
+
+	dynamicTools := buildDynamicTools(opts.Tracker)
+
+	threadStartReq, err := Request(2, MethodThreadStart, ThreadStartParams{
+		ApprovalPolicy: a.approvalPolicy,
+		Sandbox:        a.sandbox,
+		CWD:            opts.WorkspacePath,
+		DynamicTools:   dynamicTools,
+	})
+	if err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: build thread/start request: %w", err)
+	}
+	if err := enc.Encode(threadStartReq); err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: send thread/start request: %w", err)
+	}
+
+	threadResp, err := decodeWithTimeout(dec, a.readTimeout)
+	if err != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: read thread/start response: %w", err)
+	}
+	if threadResp.Error != nil {
+		stdinPipe.Close()
+		session.Close()
+		sshCl.Close(sshConn)
+		return nil, fmt.Errorf("codex ssh: thread/start failed: %s", threadResp.Error.Message)
+	}
+
+	var threadResult struct {
+		ThreadID string `json:"threadId"`
+	}
+	if len(threadResp.Result) > 0 {
+		if err := json.Unmarshal(threadResp.Result, &threadResult); err != nil {
+			stdinPipe.Close()
+			session.Close()
+			sshCl.Close(sshConn)
+			return nil, fmt.Errorf("codex ssh: parse thread/start result: %w", err)
+		}
+	}
+
+	sess := &CodexSession{
+		stdin:          stdinPipe,
+		enc:            enc,
+		dec:            dec,
+		threadID:       threadResult.ThreadID,
+		opts:           opts,
+		turnTimeout:    a.turnTimeout,
+		readTimeout:    a.readTimeout,
+		stallTimeout:   a.stallTimeout,
+		approvalPolicy: a.approvalPolicy,
+		sandbox:        a.sandbox,
+		sshClient:      sshCl,
+		sshConn:        sshConn,
+	}
+
+	return sess, nil
+}
+
 // CodexSession implements agent.Session for an active Codex conversation.
 type CodexSession struct {
 	cmd            *exec.Cmd
@@ -210,6 +382,12 @@ type CodexSession struct {
 	approvalPolicy string
 	sandbox        string
 	nextID         int
+
+	// SSH session fields (nil for local execution).
+	sshClient *sshclient.SSHClient
+	sshConn   interface {
+		Close() error
+	}
 }
 
 // RunTurn sends a turn/start request and processes the message loop until the
@@ -304,6 +482,8 @@ func (s *CodexSession) handleNotification(_ context.Context, msg *Message) (agen
 			Completed: true,
 			Usage:     usage,
 			Output:    output,
+			SessionID: fmt.Sprintf("%s-%d", s.threadID, s.nextID),
+			RateLimits: extractRateLimits(msg),
 		}, true, nil
 
 	case MethodTurnFailed:
@@ -338,7 +518,19 @@ func (s *CodexSession) handleServerRequest(ctx context.Context, msg *Message) er
 		return handleToolCall(ctx, msg, s.enc, s.opts.Tracker)
 
 	case MethodItemToolRequestUserInput:
-		return fmt.Errorf("codex: agent requested user input, which is not supported in automated mode")
+		var id int
+		if msg.ID != nil {
+			_ = json.Unmarshal(*msg.ID, &id)
+		}
+		errResp := ErrorResponse(id, &RPCError{
+			Code:    -32001,
+			Message: "user input not supported in automated mode",
+		})
+		if encodeErr := s.enc.Encode(errResp); encodeErr != nil {
+			return fmt.Errorf("codex: send user-input rejection: %w", encodeErr)
+		}
+		slog.Warn("codex: agent requested user input, rejected")
+		return nil
 
 	default:
 		// Unknown server request; respond with a generic acknowledgment.
@@ -357,22 +549,38 @@ func (s *CodexSession) handleServerRequest(ctx context.Context, msg *Message) er
 	}
 }
 
-// Close terminates the Codex subprocess.
+// Close terminates the Codex subprocess and closes any SSH connection.
 func (s *CodexSession) Close() error {
-	if err := s.stdin.Close(); err != nil {
-		return fmt.Errorf("codex: close stdin: %w", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- s.cmd.Wait() }()
-	select {
-	case <-time.After(5 * time.Second):
-		if err := s.cmd.Process.Kill(); err != nil {
-			return fmt.Errorf("codex: kill process: %w", err)
+	var firstErr error
+
+	if s.stdin != nil {
+		if err := s.stdin.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("codex: close stdin: %w", err)
 		}
-		return fmt.Errorf("codex: process did not exit gracefully")
-	case err := <-done:
-		return err
 	}
+
+	if s.cmd != nil && s.cmd.Process != nil {
+		done := make(chan error, 1)
+		go func() { done <- s.cmd.Wait() }()
+		select {
+		case <-time.After(5 * time.Second):
+			if err := s.cmd.Process.Kill(); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("codex: kill process: %w", err)
+			}
+		case err := <-done:
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	if s.sshConn != nil {
+		if err := s.sshConn.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("codex: close ssh connection: %w", err)
+		}
+	}
+
+	return firstErr
 }
 
 // decodeWithTimeout reads one message with a fixed timeout.
@@ -464,38 +672,61 @@ func extractOutput(msg *Message) string {
 	return params.Output
 }
 
+// extractRateLimits parses rate-limit data from a turn/completed notification.
+func extractRateLimits(msg *Message) map[string]any {
+	if len(msg.Params) == 0 {
+		return nil
+	}
+	var params struct {
+		RateLimits map[string]any `json:"rateLimits"`
+	}
+	if err := json.Unmarshal(msg.Params, &params); err != nil || len(params.RateLimits) == 0 {
+		return nil
+	}
+	return params.RateLimits
+}
+
 // buildDynamicTools constructs the list of dynamic tools to provide to Codex
 // based on the tracker type.
 func buildDynamicTools(t tracker.Tracker) []DynamicTool {
 	if t == nil {
 		return nil
 	}
-	// For now, always add both tools. The actual execution will be a no-op
-	// until we have access to the raw tracker client.
-	return []DynamicTool{
-		{
-			Name:        "linear_graphql",
-			Description: "Execute a GraphQL query against the Linear API",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"query": map[string]any{"type": "string", "description": "GraphQL query string"},
+
+	var tools []DynamicTool
+
+	// Check if the tracker is a Linear adapter.
+	if _, ok := t.(tracker.RawClientProvider); ok {
+		// Add both tools — the executeDynamicTool function will check
+		// the actual client type at runtime and reject mismatched calls.
+		tools = append(tools,
+			DynamicTool{
+				Name:        "linear_graphql",
+				Description: "Execute a GraphQL query against the Linear API",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"query":     map[string]any{"type": "string", "description": "GraphQL query string"},
+						"variables": map[string]any{"type": "object", "description": "GraphQL variables"},
+					},
+					"required": []string{"query"},
 				},
-				"required": []string{"query"},
 			},
-		},
-		{
-			Name:        "plane_rest",
-			Description: "Make a REST API call to Plane",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"method": map[string]any{"type": "string", "description": "HTTP method"},
-					"path":   map[string]any{"type": "string", "description": "API path"},
-					"body":   map[string]any{"type": "string", "description": "Request body as JSON string"},
+			DynamicTool{
+				Name:        "plane_rest",
+				Description: "Make a REST API call to Plane",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"method": map[string]any{"type": "string", "description": "HTTP method"},
+						"path":   map[string]any{"type": "string", "description": "API path"},
+						"body":   map[string]any{"type": "string", "description": "Request body as JSON string"},
+					},
+					"required": []string{"method", "path"},
 				},
-				"required": []string{"method", "path"},
 			},
-		},
+		)
 	}
+
+	return tools
 }

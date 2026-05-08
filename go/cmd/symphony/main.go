@@ -83,8 +83,17 @@ func main() {
 	// Create elector.
 	var elector ha.Elector
 	if cfg.HA.Enabled {
-		slog.Warn("HA enabled but etcd elector not yet implemented, using local elector")
-		elector = ha.NewLocalElector()
+		etcdElector, err := ha.NewEtcdElector(ha.EtcdConfig{
+			Endpoints:     cfg.HA.EtcdEndpoints,
+			LeaseTTL:      cfg.HA.LeaseTTLMS / 1000,
+			AdvertiseAddr: cfg.HA.AdvertiseAddr,
+		})
+		if err != nil {
+			slog.Error("create etcd elector", "error", err)
+			os.Exit(1)
+		}
+		elector = etcdElector
+		slog.Info("HA enabled, using etcd elector", "endpoints", cfg.HA.EtcdEndpoints, "advertise", cfg.HA.AdvertiseAddr)
 	} else {
 		elector = ha.NewLocalElector()
 	}
@@ -179,7 +188,18 @@ func setupLogger(level string) {
 	default:
 		l = slog.LevelInfo
 	}
-	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l})
+
+	logFormat := os.Getenv("SYMPHONY_LOG_FORMAT")
+
+	var h slog.Handler
+	opts := &slog.HandlerOptions{Level: l}
+
+	switch logFormat {
+	case "text":
+		h = slog.NewTextHandler(os.Stdout, opts)
+	default:
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	}
 	slog.SetDefault(slog.New(h))
 }
 

@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/exec"
 	"strings"
 
 	"github.com/ainative/go-symphony/internal/agent"
+	"github.com/ainative/go-symphony/internal/sshclient"
 )
 
 // Compile-time interface checks.
@@ -81,9 +83,18 @@ type ClaudeSession struct {
 
 // RunTurn spawns a `claude -p <prompt> --output-format stream-json` subprocess,
 // reads the NDJSON output, and maps events to a TurnResult.
+// When WorkerHost is set, each turn is executed via SSH.
 func (s *ClaudeSession) RunTurn(ctx context.Context, prompt string, opts agent.TurnOptions) (agent.TurnResult, error) {
 	s.turnCount++
 
+	if s.opts.WorkerHost != "" {
+		return s.runTurnSSH(ctx, prompt, opts)
+	}
+	return s.runTurnLocal(ctx, prompt, opts)
+}
+
+// runTurnLocal executes a claude turn as a local subprocess.
+func (s *ClaudeSession) runTurnLocal(ctx context.Context, prompt string, opts agent.TurnOptions) (agent.TurnResult, error) {
 	cmd := s.buildCommand(prompt, opts)
 
 	stdout, err := cmd.StdoutPipe()
@@ -106,11 +117,109 @@ func (s *ClaudeSession) RunTurn(ctx context.Context, prompt string, opts agent.T
 	}
 
 	if waitErr != nil {
-		// Non-zero exit — turn failed.
 		return agent.TurnResult{}, fmt.Errorf("claude: process exited with error: %w", waitErr)
 	}
 
 	return result, nil
+}
+
+// runTurnSSH executes a claude turn over SSH.
+func (s *ClaudeSession) runTurnSSH(ctx context.Context, prompt string, opts agent.TurnOptions) (agent.TurnResult, error) {
+	sshCfg := sshclient.Config{
+		Host: s.opts.WorkerHost,
+	}
+	sshCl := sshclient.New(sshCfg)
+
+	sshConn, err := sshCl.Dial(ctx)
+	if err != nil {
+		return agent.TurnResult{}, fmt.Errorf("claude ssh: dial: %w", err)
+	}
+	defer sshCl.Close(sshConn)
+
+	slog.Debug("claude ssh: connected for turn", "host", s.opts.WorkerHost)
+
+	// Build the claude command args.
+	args := s.buildSSHArgs(prompt, opts)
+	remoteCmd := strings.Join(args, " ")
+	fullCmd := sshclient.BuildCommand(remoteCmd, s.opts.WorkspacePath)
+
+	session, err := sshConn.NewSession()
+	if err != nil {
+		return agent.TurnResult{}, fmt.Errorf("claude ssh: new session: %w", err)
+	}
+	defer session.Close()
+
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return agent.TurnResult{}, fmt.Errorf("claude ssh: stdout pipe: %w", err)
+	}
+
+	if err := session.Start(fullCmd); err != nil {
+		return agent.TurnResult{}, fmt.Errorf("claude ssh: start: %w", err)
+	}
+
+	result, parseErr := parseStream(ctx, stdout)
+	waitErr := session.Wait()
+
+	if parseErr != nil {
+		return agent.TurnResult{}, fmt.Errorf("claude ssh: parse stream: %w", parseErr)
+	}
+	if waitErr != nil {
+		return agent.TurnResult{}, fmt.Errorf("claude ssh: process exited with error: %w", waitErr)
+	}
+
+	return result, nil
+}
+
+// buildSSHArgs constructs the claude command arguments for SSH execution.
+func (s *ClaudeSession) buildSSHArgs(prompt string, opts agent.TurnOptions) []string {
+	parts := strings.Fields(s.adapter.command)
+	if len(parts) == 0 {
+		parts = []string{"claude"}
+	}
+
+	args := make([]string, 0)
+	args = append(args, parts...)
+
+	args = append(args, "-p", shellQuoteArg(prompt), "--output-format", "stream-json")
+
+	permMode := s.adapter.permissionMode
+	if opts.ApprovalPolicy != "" {
+		permMode = opts.ApprovalPolicy
+	}
+	switch permMode {
+	case "auto", "bypassPermissions", "dangerously-skip-permissions":
+		args = append(args, "--dangerously-skip-permissions")
+	default:
+		if len(s.adapter.allowedTools) > 0 {
+			args = append(args, "--allowedTools", strings.Join(s.adapter.allowedTools, ","))
+		}
+	}
+
+	maxTurns := s.adapter.maxTurns
+	if opts.MaxTurns > 0 {
+		maxTurns = opts.MaxTurns
+	}
+	if maxTurns > 0 {
+		args = append(args, "--max-turns", fmt.Sprintf("%d", maxTurns))
+	}
+
+	return args
+}
+
+// shellQuoteArg wraps a prompt string in single quotes for shell safety.
+func shellQuoteArg(s string) string {
+	result := make([]byte, 0, len(s)+2)
+	result = append(result, '\'')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\'' {
+			result = append(result, '\'', '\\', '\'', '\'')
+		} else {
+			result = append(result, s[i])
+		}
+	}
+	result = append(result, '\'')
+	return string(result)
 }
 
 // Close is a no-op for Claude Code (no persistent session).

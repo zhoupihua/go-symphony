@@ -20,6 +20,21 @@ type StateProvider interface {
 
 	// RunningCount returns the number of currently running issues.
 	RunningCount() int
+
+	// RunningIssue returns the RunInfo for a specific issue, or nil if not running.
+	RunningIssue(issueID string) *orchestrator.RunInfo
+
+	// PendingRetries returns all pending retry entries.
+	PendingRetries() map[string]*orchestrator.RetryEntry
+
+	// RetryCount returns the number of pending retries.
+	RetryCount() int
+
+	// TotalRuntimeSeconds returns aggregate runtime in seconds.
+	TotalRuntimeSeconds() float64
+
+	// RateLimits returns the latest rate-limit payload.
+	RateLimits() map[string]any
 }
 
 // Refresher triggers an immediate orchestrator poll cycle.
@@ -57,6 +72,8 @@ func New(state StateProvider, elector ha.Elector, refresh Refresher, cfg config.
 	// API endpoints with CORS support.
 	mux.HandleFunc("GET /api/v1/state", s.cors(s.handleState))
 	mux.HandleFunc("OPTIONS /api/v1/state", s.cors(s.handleOptions))
+	mux.HandleFunc("GET /api/v1/issues/{identifier}", s.cors(s.handleIssue))
+	mux.HandleFunc("OPTIONS /api/v1/issues/{identifier}", s.cors(s.handleOptions))
 	mux.HandleFunc("POST /api/v1/refresh", s.cors(s.handleRefresh))
 	mux.HandleFunc("OPTIONS /api/v1/refresh", s.cors(s.handleOptions))
 	mux.HandleFunc("GET /api/v1/events", s.cors(s.handleEvents))

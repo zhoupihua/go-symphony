@@ -2,16 +2,19 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ainative/go-symphony/internal/agent"
 	"github.com/ainative/go-symphony/internal/agentrunner"
 	"github.com/ainative/go-symphony/internal/config"
 	"github.com/ainative/go-symphony/internal/ha"
+	"github.com/ainative/go-symphony/internal/sshclient"
 	"github.com/ainative/go-symphony/internal/tracker"
 	"github.com/ainative/go-symphony/internal/workspace"
 )
@@ -25,12 +28,13 @@ const (
 // candidate issues, dispatches them to agent runners up to concurrency limits,
 // and reconciles running issues for stall detection and state changes.
 type Orchestrator struct {
-	Tracker tracker.Tracker
-	Agent   agent.Agent
-	Elector ha.Elector
-	Cfg     func() config.Schema // called each tick for hot-reload support
-	Tmpl    func() string        // called each tick for hot-reload support
-	State   *State
+	Tracker      tracker.Tracker
+	Agent        agent.Agent
+	Elector      ha.Elector
+	Cfg          func() config.Schema // called each tick for hot-reload support
+	Tmpl         func() string        // called each tick for hot-reload support
+	State        *State
+	nextHostIdx  int // round-robin index for SSH host selection
 }
 
 // New creates a new Orchestrator.
@@ -43,6 +47,18 @@ func New(tr tracker.Tracker, ag agent.Agent, el ha.Elector, cfgFn func() config.
 		Tmpl:    tmplFn,
 		State:   NewState(),
 	}
+}
+
+// selectWorkerHost picks a host from the SSH host pool using round-robin.
+// Returns empty string for local execution.
+func (o *Orchestrator) selectWorkerHost(cfg config.Schema) string {
+	hosts := cfg.Worker.SSHHosts
+	if len(hosts) == 0 {
+		return ""
+	}
+	host := hosts[o.nextHostIdx%len(hosts)]
+	o.nextHostIdx++
+	return host
 }
 
 // Run starts the orchestrator loop. It blocks until the context is cancelled.
@@ -116,6 +132,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context, cfg config.Schema) 
 				slog.Warn("stall detected, terminating agent", "issue", issueID, "elapsed", elapsed)
 				o.State.RemoveRunning(issueID)
 				o.State.ReleaseClaim(issueID)
+				o.addRuntime(info)
 				o.scheduleRetry(issueID, info, false, cfg)
 				continue
 			}
@@ -132,13 +149,32 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context, cfg config.Schema) 
 				slog.Info("issue moved to terminal state, stopping agent", "issue", issueID, "state", issues[0].State)
 				o.State.RemoveRunning(issueID)
 				o.State.ReleaseClaim(issueID)
-				// Clean up workspace.
-				if info.WorkspacePath != "" {
-					_ = workspace.Remove(ctx, info.WorkspacePath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeoutVal(cfg))
-				}
+				o.addRuntime(info)
+				// Clean up workspace (local or remote).
+				o.removeWorkspace(ctx, cfg, info)
 			}
 		}
 	}
+}
+
+// removeWorkspace removes the workspace for a running issue (local or remote).
+func (o *Orchestrator) removeWorkspace(ctx context.Context, cfg config.Schema, info *RunInfo) {
+	if info.WorkspacePath == "" {
+		return
+	}
+	hookTimeout := hookTimeoutVal(cfg)
+	if workspace.IsRemote(info.WorkerHost) {
+		sshCfg := sshConfigFromHost(info.WorkerHost)
+		_ = workspace.RemoveRemote(ctx, sshCfg, info.WorkspacePath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeout)
+	} else {
+		_ = workspace.Remove(ctx, info.WorkspacePath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeout)
+	}
+}
+
+// addRuntime accumulates ended-session runtime into the state counter.
+func (o *Orchestrator) addRuntime(info *RunInfo) {
+	runtimeMs := time.Since(info.StartedAt).Milliseconds()
+	o.State.AddRuntimeMs(runtimeMs)
 }
 
 // processRetries dispatches issues whose retry timer has fired.
@@ -201,7 +237,7 @@ func (o *Orchestrator) dispatch(ctx context.Context, cfg config.Schema, candidat
 }
 
 // canDispatch checks whether an issue can be dispatched given concurrency
-// limits, claim status, and running status.
+// limits, claim status, running status, and blocker rules.
 func (o *Orchestrator) canDispatch(cfg config.Schema, issue tracker.Issue) bool {
 	// Already running or claimed?
 	if o.State.IsRunning(issue.ID) || o.State.IsClaimed(issue.ID) {
@@ -218,6 +254,11 @@ func (o *Orchestrator) canDispatch(cfg config.Schema, issue tracker.Issue) bool 
 		return false
 	}
 
+	// Blocker rule: Todo issues with non-terminal blockers are not eligible.
+	if strings.EqualFold(issue.State, "todo") && o.isBlockedByNonTerminal(issue, cfg.Tracker.TerminalStates) {
+		return false
+	}
+
 	// Global concurrency limit.
 	maxConcurrent := cfg.Agent.MaxConcurrent
 	if maxConcurrent <= 0 {
@@ -227,10 +268,10 @@ func (o *Orchestrator) canDispatch(cfg config.Schema, issue tracker.Issue) bool 
 		return false
 	}
 
-	// Per-state concurrency limit.
+	// Per-state concurrency limit (keys normalized to lowercase).
 	stateCounts := o.State.RunningByState()
-	if limit, ok := cfg.Agent.MaxConcurrentByState[issue.State]; ok && limit > 0 {
-		if stateCounts[issue.State] >= limit {
+	if limit, ok := cfg.Agent.MaxConcurrentByState[strings.ToLower(issue.State)]; ok && limit > 0 {
+		if stateCounts[strings.ToLower(issue.State)] >= limit {
 			return false
 		}
 	}
@@ -238,32 +279,65 @@ func (o *Orchestrator) canDispatch(cfg config.Schema, issue tracker.Issue) bool 
 	return true
 }
 
+// isBlockedByNonTerminal returns true if the issue has any blocker that is not
+// in a terminal state. Unknown blocker states are treated as non-terminal (safe default).
+func (o *Orchestrator) isBlockedByNonTerminal(issue tracker.Issue, terminalStates []string) bool {
+	for _, blocker := range issue.BlockedBy {
+		if blocker.State == "" {
+			// Unknown state — treat as non-terminal to be safe.
+			return true
+		}
+		if !isTerminalState(blocker.State, terminalStates) {
+			return true
+		}
+	}
+	return false
+}
+
 // doDispatch starts an agent run for the given issue in a goroutine.
 func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue tracker.Issue, attempt int) {
 	o.State.Claim(issue.ID)
 
+	workerHost := o.selectWorkerHost(cfg)
+
 	runner := &agentrunner.Runner{
-		Agent:   o.Agent,
-		Tracker: o.Tracker,
-		Cfg:     cfg,
-		Tmpl:    o.Tmpl(),
+		Agent:      o.Agent,
+		Tracker:    o.Tracker,
+		Cfg:        cfg,
+		Tmpl:       o.Tmpl(),
+		WorkerHost: workerHost,
 	}
 
-	// Create workspace first to get the path.
+	// Create workspace (local or remote).
 	hookTimeout := hookTimeoutVal(cfg)
-	wsPath, _, err := workspace.Create(ctx, cfg.Workspace.Root, issue.Identifier, cfg.Hooks.AfterCreate, hookTimeout)
+	var wsPath string
+	var createdNow bool
+	var err error
+	sshCfg := sshConfigFromHost(workerHost)
+	if workspace.IsRemote(workerHost) {
+		wsPath, createdNow, err = workspace.CreateRemote(ctx, sshCfg, cfg.Workspace.Root, issue.Identifier, cfg.Hooks.AfterCreate, hookTimeout)
+	} else {
+		wsPath, createdNow, err = workspace.Create(ctx, cfg.Workspace.Root, issue.Identifier, cfg.Hooks.AfterCreate, hookTimeout)
+	}
 	if err != nil {
-		slog.Error("create workspace for dispatch", "issue", issue.ID, "error", err)
+		slog.Error("create workspace for dispatch", "issue", issue.ID, "error", err, "host", workerHost)
+		// Clean up if partially created remotely.
+		if workspace.IsRemote(workerHost) && wsPath != "" {
+			_ = workspace.RemoveRemote(ctx, sshCfg, wsPath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeout)
+		}
 		o.State.ReleaseClaim(issue.ID)
 		return
 	}
 
+	_ = createdNow // tracked for future hook optimization
+
 	info := &RunInfo{
-		Issue:        issue,
+		Issue:         issue,
+		WorkerHost:    workerHost,
 		WorkspacePath: wsPath,
-		Attempt:      attempt,
-		StartedAt:    time.Now(),
-		LastActivity: time.Now(),
+		Attempt:       attempt,
+		StartedAt:     time.Now(),
+		LastActivity:  time.Now(),
 	}
 	o.State.SetRunning(issue.ID, info)
 
@@ -283,11 +357,14 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 		if err != nil {
 			slog.Error("agent run failed", "issue", issue.ID, "error", err, "attempt", attempt)
 			o.scheduleRetry(issue.ID, runInfo, false, cfg)
+		o.addRuntime(runInfo)
+			o.State.UpdateLastError(issue.ID, err.Error())
 			return
 		}
 
 		if result.Completed {
 			o.State.MarkCompleted(issue.ID)
+			o.addRuntime(runInfo)
 			slog.Info("agent run completed", "issue", issue.ID, "turns", result.TotalTurns)
 			// Check if issue is still active for continuation retry.
 			if o.Tracker != nil && isActiveState(issue.State, cfg.Tracker.ActiveStates) {
@@ -299,6 +376,7 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 		}
 
 		// Not completed but no error — hit max turns or similar.
+		o.addRuntime(runInfo)
 		o.scheduleRetry(issue.ID, runInfo, true, cfg)
 	}()
 
@@ -308,6 +386,15 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 			o.State.UpdateActivity(issue.ID)
 			if evt.Usage != nil {
 				o.State.UpdateUsage(issue.ID, *evt.Usage)
+			}
+		if evt.SessionID != "" {
+					o.State.UpdateSessionID(issue.ID, evt.SessionID)
+			}
+			if evt.RateLimits != nil {
+				o.State.SetRateLimits(evt.RateLimits)
+			}
+			if evt.Type == agent.EventTurnFailed {
+				o.State.UpdateLastError(issue.ID, evt.Message)
 			}
 		}
 	}()
@@ -370,7 +457,8 @@ func (o *Orchestrator) startupCleanup(ctx context.Context, cfg config.Schema) {
 		}
 		key := trackerSanitizeKey(iss.Identifier)
 		wsPath := cfg.Workspace.Root + "/" + key
-		if err := workspace.Remove(ctx, wsPath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeoutVal(cfg)); err != nil {
+		hookTimeout := hookTimeoutVal(cfg)
+		if err := workspace.Remove(ctx, wsPath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeout); err != nil {
 			slog.Warn("startup cleanup: failed to remove workspace", "issue", iss.Identifier, "error", err)
 		}
 	}
@@ -460,4 +548,17 @@ func trackerSanitizeKey(s string) string {
 		}
 	}
 	return string(b)
+}
+
+// sshConfigFromHost parses a "host:port" or "host" string into an sshclient.Config.
+func sshConfigFromHost(host string) sshclient.Config {
+	cfg := sshclient.Config{Host: host}
+	if idx := strings.LastIndex(host, ":"); idx > 0 {
+		cfg.Host = host[:idx]
+		var port int
+		if _, err := fmt.Sscanf(host[idx+1:], "%d", &port); err == nil && port > 0 {
+			cfg.Port = port
+		}
+	}
+	return cfg
 }

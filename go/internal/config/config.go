@@ -80,6 +80,14 @@ func applyDefaults(s *Schema) {
 	if s.Agent.MaxRetryBackoffMS == 0 {
 		s.Agent.MaxRetryBackoffMS = 300000
 	}
+	// Normalize per-state concurrency keys to lowercase.
+	if len(s.Agent.MaxConcurrentByState) > 0 {
+		normalized := make(map[string]int, len(s.Agent.MaxConcurrentByState))
+		for k, v := range s.Agent.MaxConcurrentByState {
+			normalized[strings.ToLower(k)] = v
+		}
+		s.Agent.MaxConcurrentByState = normalized
+	}
 	// Codex defaults
 	if s.Agent.Codex.ApprovalPolicy == "" {
 		s.Agent.Codex.ApprovalPolicy = "auto"

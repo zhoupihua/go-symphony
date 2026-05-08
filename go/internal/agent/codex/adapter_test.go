@@ -545,6 +545,7 @@ func (s *stubTracker) CreateComment(_ context.Context, _, _ string) error { retu
 func (s *stubTracker) UpdateIssueState(_ context.Context, _, _ string) error {
 	return nil
 }
+func (s *stubTracker) RawClient() any { return nil }
 
 // mockBuffer is a simple read/write buffer for tests.
 type mockBuffer struct {

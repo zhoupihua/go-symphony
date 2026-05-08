@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,8 @@ type RunInfo struct {
 	LastActivity  time.Time // last Codex/agent activity timestamp
 	TurnCount     int
 	TotalUsage    agent.UsageReport
+	SessionID     string // "<thread_id>-<turn_id>" for observability
+	LastError     string // most recent error message for this run
 }
 
 // RetryEntry tracks a pending retry for an issue.
@@ -30,11 +33,13 @@ type RetryEntry struct {
 
 // State holds the orchestrator's runtime state.
 type State struct {
-	mu            sync.RWMutex
-	running       map[string]*RunInfo    // issueID -> RunInfo
-	claimed       map[string]struct{}     // issueID set: issues claimed for dispatch/retry
-	retryAttempts map[string]*RetryEntry  // issueID -> pending retry
-	completed     map[string]struct{}     // issueID set: successfully completed
+	mu             sync.RWMutex
+	running        map[string]*RunInfo    // issueID -> RunInfo
+	claimed        map[string]struct{}     // issueID set: issues claimed for dispatch/retry
+	retryAttempts  map[string]*RetryEntry  // issueID -> pending retry
+	completed      map[string]struct{}     // issueID set: successfully completed
+	totalRuntimeMs int64                   // cumulative ended-session runtime in milliseconds
+	rateLimits     map[string]any          // latest rate-limit payload from agent
 }
 
 // NewState creates a new empty State.
@@ -91,13 +96,13 @@ func (s *State) RunningCount() int {
 	return len(s.running)
 }
 
-// RunningByState returns the count of running issues in each state.
+// RunningByState returns the count of running issues in each state (keys lowercased).
 func (s *State) RunningByState() map[string]int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	counts := make(map[string]int)
 	for _, info := range s.running {
-		counts[info.Issue.State]++
+		counts[strings.ToLower(info.Issue.State)]++
 	}
 	return counts
 }
@@ -153,6 +158,20 @@ func (s *State) PendingRetries() map[string]*RetryEntry {
 	return out
 }
 
+// RetryCount returns the number of pending retries.
+func (s *State) RetryCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.retryAttempts)
+}
+
+// RunningIssue returns the RunInfo for a specific issue, or nil if not running.
+func (s *State) RunningIssue(issueID string) *RunInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.running[issueID]
+}
+
 // MarkCompleted marks an issue as successfully completed.
 func (s *State) MarkCompleted(issueID string) {
 	s.mu.Lock()
@@ -187,4 +206,62 @@ func (s *State) UpdateUsage(issueID string, usage agent.UsageReport) {
 		info.TotalUsage.TotalTokens += usage.TotalTokens
 		info.TurnCount++
 	}
+}
+
+// UpdateSessionID updates the session ID for a running issue.
+func (s *State) UpdateSessionID(issueID, sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if info, ok := s.running[issueID]; ok {
+		info.SessionID = sessionID
+	}
+}
+
+// UpdateLastError updates the last error message for a running issue.
+func (s *State) UpdateLastError(issueID, errMsg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if info, ok := s.running[issueID]; ok {
+		info.LastError = errMsg
+	}
+}
+
+// AddRuntimeMs adds ended-session runtime to the cumulative total.
+func (s *State) AddRuntimeMs(ms int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.totalRuntimeMs += ms
+}
+
+// TotalRuntimeSeconds returns the aggregate runtime in seconds (ended sessions + active).
+func (s *State) TotalRuntimeSeconds() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	total := float64(s.totalRuntimeMs) / 1000.0
+	now := time.Now()
+	for _, info := range s.running {
+		total += now.Sub(info.StartedAt).Seconds()
+	}
+	return total
+}
+
+// SetRateLimits updates the latest rate-limit payload.
+func (s *State) SetRateLimits(limits map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rateLimits = limits
+}
+
+// RateLimits returns the latest rate-limit payload.
+func (s *State) RateLimits() map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.rateLimits == nil {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(s.rateLimits))
+	for k, v := range s.rateLimits {
+		out[k] = v
+	}
+	return out
 }

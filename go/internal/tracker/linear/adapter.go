@@ -9,8 +9,11 @@ import (
 	"github.com/ainative/go-symphony/internal/tracker"
 )
 
-// Compile-time interface check.
-var _ tracker.Tracker = (*Adapter)(nil)
+// Compile-time interface checks.
+var (
+	_ tracker.Tracker           = (*Adapter)(nil)
+	_ tracker.RawClientProvider = (*Adapter)(nil)
+)
 
 // Adapter implements tracker.Tracker for the Linear issue tracker.
 type Adapter struct {
@@ -134,6 +137,11 @@ func (a *Adapter) UpdateIssueState(ctx context.Context, issueID, state string) e
 	return a.client.UpdateIssueStateMutation(ctx, issueID, state)
 }
 
+// RawClient returns the underlying Linear GraphQL client.
+func (a *Adapter) RawClient() any {
+	return a.client
+}
+
 // normalizeIssues converts a slice of raw Linear issues to tracker.Issue values.
 func normalizeIssues(raw []linearIssue) []tracker.Issue {
 	if len(raw) == 0 {
@@ -171,14 +179,18 @@ func normalizeLabels(ri linearIssue) []string {
 	return labels
 }
 
-// extractBlockedBy returns identifiers of issues that block this one,
+// extractBlockedBy returns BlockerRefs for issues that block this one,
 // derived from inverse relations of type "blocks".
-func extractBlockedBy(ri linearIssue) []string {
-	var blocked []string
+func extractBlockedBy(ri linearIssue) []tracker.BlockerRef {
+	var blocked []tracker.BlockerRef
 	for _, rel := range ri.InverseRelations.Nodes {
 		if strings.ToLower(strings.TrimSpace(rel.Type)) == "blocks" {
 			if rel.Issue.Identifier != "" {
-				blocked = append(blocked, rel.Issue.Identifier)
+				blocked = append(blocked, tracker.BlockerRef{
+					ID:         rel.Issue.ID,
+					Identifier: rel.Issue.Identifier,
+					State:      rel.Issue.State.Name,
+				})
 			}
 		}
 	}

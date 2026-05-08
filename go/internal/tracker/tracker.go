@@ -19,3 +19,13 @@ type Tracker interface {
 	// UpdateIssueState transitions an issue to a new state.
 	UpdateIssueState(ctx context.Context, issueID, state string) error
 }
+
+// RawClientProvider is an optional interface that Tracker adapters can implement
+// to expose their underlying API client for use by dynamic tools (e.g., Codex's
+// linear_graphql and plane_rest tools).
+type RawClientProvider interface {
+	// RawClient returns the underlying API client.
+	// The return type is interface{} because each tracker has a different client type.
+	// Callers should type-assert to the expected client type.
+	RawClient() any
+}

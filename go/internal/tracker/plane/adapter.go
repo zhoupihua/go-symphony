@@ -11,8 +11,11 @@ import (
 	"github.com/ainative/go-symphony/internal/tracker"
 )
 
-// Compile-time interface check.
-var _ tracker.Tracker = (*Adapter)(nil)
+// Compile-time interface checks.
+var (
+	_ tracker.Tracker           = (*Adapter)(nil)
+	_ tracker.RawClientProvider = (*Adapter)(nil)
+)
 
 // Adapter implements tracker.Tracker for Plane's REST API.
 type Adapter struct {
@@ -157,6 +160,11 @@ func (a *Adapter) UpdateIssueState(ctx context.Context, issueID, state string) e
 	}
 
 	return a.client.UpdateIssueState(ctx, issueID, stateUUID)
+}
+
+// RawClient returns the underlying Plane REST client.
+func (a *Adapter) RawClient() any {
+	return a.client
 }
 
 // loadStates fetches and caches state ID-to-name mappings.

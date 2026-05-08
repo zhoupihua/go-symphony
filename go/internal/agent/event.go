@@ -17,12 +17,13 @@ const (
 
 // Event represents a single event emitted during an agent session.
 type Event struct {
-	Type      EventType
-	IssueID   string
-	SessionID string
-	Message   string
-	Usage     *UsageReport
-	Timestamp time.Time
+	Type       EventType
+	IssueID    string
+	SessionID  string
+	Message    string
+	Usage      *UsageReport
+	RateLimits map[string]any // latest rate-limit payload from agent
+	Timestamp  time.Time
 }
 
 // UsageReport tracks token consumption for an agent turn.

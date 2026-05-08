@@ -34,6 +34,29 @@ func (m *mockStateProvider) RunningCount() int {
 	return m.runningCount
 }
 
+func (m *mockStateProvider) RunningIssue(issueID string) *orchestrator.RunInfo {
+	if m.running != nil {
+		return m.running[issueID]
+	}
+	return nil
+}
+
+func (m *mockStateProvider) PendingRetries() map[string]*orchestrator.RetryEntry {
+	return map[string]*orchestrator.RetryEntry{}
+}
+
+func (m *mockStateProvider) RetryCount() int {
+	return 0
+}
+
+func (m *mockStateProvider) TotalRuntimeSeconds() float64 {
+	return 0
+}
+
+func (m *mockStateProvider) RateLimits() map[string]any {
+	return nil
+}
+
 // mockRefresher implements Refresher for testing.
 type mockRefresher struct {
 	called bool
@@ -228,8 +251,8 @@ func TestRefreshEndpoint(t *testing.T) {
 	resp := w.Result()
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("expected status 202, got %d", resp.StatusCode)
 	}
 
 	if !refresh.called {

@@ -470,11 +470,11 @@ func TestBlockedBy_FromInverseRelations(t *testing.T) {
 	if len(issues[0].BlockedBy) != 2 {
 		t.Fatalf("expected 2 blocked_by entries, got %d", len(issues[0].BlockedBy))
 	}
-	if issues[0].BlockedBy[0] != "ENG-5" {
-		t.Errorf("expected blocked_by[0] 'ENG-5', got %q", issues[0].BlockedBy[0])
+	if issues[0].BlockedBy[0].Identifier != "ENG-5" {
+		t.Errorf("expected blocked_by[0] 'ENG-5', got %q", issues[0].BlockedBy[0].Identifier)
 	}
-	if issues[0].BlockedBy[1] != "ENG-6" {
-		t.Errorf("expected blocked_by[1] 'ENG-6', got %q", issues[0].BlockedBy[1])
+	if issues[0].BlockedBy[1].Identifier != "ENG-6" {
+		t.Errorf("expected blocked_by[1] 'ENG-6', got %q", issues[0].BlockedBy[1].Identifier)
 	}
 }
 

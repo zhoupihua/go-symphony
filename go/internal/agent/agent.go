@@ -25,9 +25,11 @@ type TurnOptions struct {
 
 // TurnResult is the outcome of a single agent turn.
 type TurnResult struct {
-	Completed bool
-	Usage     UsageReport
-	Output    string
+	Completed  bool
+	Usage      UsageReport
+	Output     string
+	SessionID  string         // composed session identifier (e.g. "<thread_id>-<turn_id>")
+	RateLimits map[string]any // rate-limit info from agent, if any
 }
 
 // Agent creates and manages sessions. Adapters implement this interface.

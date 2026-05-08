@@ -20,7 +20,7 @@ func TestRender_AllVariables(t *testing.T) {
 		Priority:    intPtr(1),
 		Labels:      []string{"bug", "mobile"},
 		URL:         "https://linear.app/issue/ENG-123",
-		BlockedBy:   []string{"ENG-100"},
+		BlockedBy:   []tracker.BlockerRef{{ID: "id-100", Identifier: "ENG-100", State: "In Progress"}},
 	}
 
 	tmpl := `Issue: {{.Issue.Identifier}}
@@ -30,7 +30,7 @@ State: {{.Issue.State}}
 Priority: {{if .Issue.Priority}}{{.Issue.Priority}}{{end}}
 Labels: {{join .Issue.Labels ", "}}
 URL: {{.Issue.URL}}
-Blocked by: {{join .Issue.BlockedBy ", "}}
+Blocked by: {{range $i, $b := .Issue.BlockedBy}}{{if $i}}, {{end}}{{$b.Identifier}}{{end}}
 Attempt: {{.Attempt}}`
 
 	got, err := Render(tmpl, issue, 2)
