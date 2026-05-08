@@ -94,6 +94,23 @@ WHEN an agent session completes normally THEN it reports completion with token u
 WHEN an agent session fails THEN it reports the error category for retry decision
 - **TEST** `TestAgent_SessionFails`
 
+#### Agent Routing
+
+WHEN an issue has a label with `agent:` prefix (e.g., `agent:claude`) THEN the specified agent adapter is used
+- **TEST** `TestAgentRouting_LabelOverride`
+
+WHEN an issue is assigned to a user in `agent.assignee_map` THEN the mapped agent adapter is used
+- **TEST** `TestAgentRouting_AssigneeMap`
+
+WHEN an issue has no agent label and the assignee is not in `assignee_map` THEN the default `agent.kind` is used
+- **TEST** `TestAgentRouting_DefaultFallback`
+
+WHEN agent routing resolves to an unknown agent kind THEN the dispatch fails with a clear error
+- **TEST** `TestAgentRouting_UnknownKindFails`
+
+WHEN multiple routing rules match (label + assignee) THEN label takes priority over assignee map
+- **TEST** `TestAgentRouting_LabelOverridesAssignee`
+
 #### Codex Adapter
 
 WHEN running a Codex session THEN the adapter starts `codex app-server` subprocess and communicates via JSON-RPC 2.0 over stdio
@@ -497,6 +514,8 @@ func (a *LinearAdapter) FetchCandidateIssues(ctx context.Context) ([]Issue, erro
 
 **Decision:** `agent.kind` is a new WORKFLOW.md front-matter key — **Rationale:** SPEC.md only defines `tracker.kind` and `codex.*` config. Adding `agent.kind` with values `"codex"` or `"claude"` lets the config select the agent adapter. For backwards compatibility, if `agent.kind` is absent but `codex.command` is present, default to `"codex"`.
 
+**Decision:** Agent routing uses 3-tier priority: label > assignee map > default — **Rationale:** In team collaboration, different developers prefer different agents. Issue label `agent:xxx` provides per-issue override (highest priority). `agent.assignee_map` maps assignee IDs to agent kinds for per-developer preference. `agent.kind` is the fallback default. This covers team collaboration without requiring AI-based selection.
+
 **Decision:** Tracker-specific config is nested under `tracker.<kind>.*` — **Rationale:** Each tracker needs different config keys (Linear: `project_slug`; Plane: `workspace_slug`, `project_id`). The pattern is: `tracker.kind` selects the adapter, then `tracker.linear.*` or `tracker.plane.*` provides adapter-specific config. Only the active tracker's config section is validated.
 
 **Decision:** `Elector` interface abstracts leadership; `LocalElector` for single-instance, `EtcdElector` for HA — **Rationale:** Single-instance deployment must not require etcd. The Elector interface lets the orchestrator code be identical for both modes. `LocalElector` always returns `IsLeader()=true` and never connects to any external service. `EtcdElector` uses etcd campaign + lease for leader election.
@@ -527,6 +546,7 @@ func (a *LinearAdapter) FetchCandidateIssues(ctx context.Context) ([]Issue, erro
 These are Go-specific extensions documented in `go/docs/SPEC-GO.md`:
 
 1. **`agent.kind` config key** — values: `"codex"`, `"claude"`. Defaults to `"codex"` for backwards compatibility.
+2. **`agent.assignee_map` config key** — maps assignee identifiers to agent kinds (e.g., `{"zhang-san": "claude", "li-si": "codex"}`). Enables per-developer agent preference in team collaboration.
 2. **Plane tracker adapter** — `tracker.kind: "plane"` with Plane-specific config.
 3. **`tracker.plane.*` config section** — `workspace_slug` (required), `project_id` (required, UUID), `api_key` (required, or `$VAR`), `endpoint` (default `https://api.plane.so/api/`).
 4. **`ha.*` config section** — `enabled` (default `false`), `etcd_endpoints` (required when enabled), `lease_ttl_ms` (default `10000`), `advertise_addr` (required when enabled, HTTP address for dashboard redirect).
