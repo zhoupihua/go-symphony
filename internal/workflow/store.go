@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/config"
+	"github.com/zhoupihua/go-symphony/internal/config"
 )
 
 // pollInterval is how often the file watcher checks for changes.

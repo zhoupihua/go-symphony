@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/agent"
+	"github.com/zhoupihua/go-symphony/internal/agent"
 )
 
 func TestNewAdapterDefaults(t *testing.T) {

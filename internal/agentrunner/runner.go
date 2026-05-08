@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/agent"
-	"github.com/ainative/go-symphony/internal/config"
-	"github.com/ainative/go-symphony/internal/prompt"
-	"github.com/ainative/go-symphony/internal/sshclient"
-	"github.com/ainative/go-symphony/internal/tracker"
-	"github.com/ainative/go-symphony/internal/workspace"
+	"github.com/zhoupihua/go-symphony/internal/agent"
+	"github.com/zhoupihua/go-symphony/internal/config"
+	"github.com/zhoupihua/go-symphony/internal/prompt"
+	"github.com/zhoupihua/go-symphony/internal/sshclient"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/workspace"
 )
 
 // RunResult holds the outcome of a full agent run for an issue.

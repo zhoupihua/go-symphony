@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
 )
 
 func makeIssue(id, identifier, title, state string) tracker.Issue {

@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/agent"
-	"github.com/ainative/go-symphony/internal/config"
-	"github.com/ainative/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/agent"
+	"github.com/zhoupihua/go-symphony/internal/config"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
 )
 
 // stubAgent implements agent.Agent for testing. It returns a pre-configured

@@ -10,13 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/agent"
-	"github.com/ainative/go-symphony/internal/agentrunner"
-	"github.com/ainative/go-symphony/internal/config"
-	"github.com/ainative/go-symphony/internal/ha"
-	"github.com/ainative/go-symphony/internal/sshclient"
-	"github.com/ainative/go-symphony/internal/tracker"
-	"github.com/ainative/go-symphony/internal/workspace"
+	"github.com/zhoupihua/go-symphony/internal/agent"
+	"github.com/zhoupihua/go-symphony/internal/agentrunner"
+	"github.com/zhoupihua/go-symphony/internal/config"
+	"github.com/zhoupihua/go-symphony/internal/ha"
+	"github.com/zhoupihua/go-symphony/internal/sshclient"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/workspace"
 )
 
 const (

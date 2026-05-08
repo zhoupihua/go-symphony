@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/sshclient"
+	"github.com/zhoupihua/go-symphony/internal/sshclient"
 )
 
 // RemoteOps provides workspace operations over SSH for remote worker hosts.

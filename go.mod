@@ -1,4 +1,4 @@
-module github.com/ainative/go-symphony
+module github.com/zhoupihua/go-symphony
 
 go 1.26.1
 

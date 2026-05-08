@@ -5,7 +5,7 @@ This document captures Go-specific extensions and implementation details beyond 
 ## Module
 
 ```
-github.com/ainative/go-symphony
+github.com/zhoupihua/go-symphony
 ```
 
 Go 1.26.1 or later.

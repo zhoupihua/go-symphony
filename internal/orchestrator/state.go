@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/agent"
-	"github.com/ainative/go-symphony/internal/ha"
-	"github.com/ainative/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/agent"
+	"github.com/zhoupihua/go-symphony/internal/ha"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
 )
 
 // RunInfo tracks an in-flight agent run for an issue.

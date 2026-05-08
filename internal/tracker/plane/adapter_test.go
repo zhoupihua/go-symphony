@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ainative/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
 )
 
 // testServer creates an httptest.Server that serves Plane API responses

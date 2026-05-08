@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/config"
-	"github.com/ainative/go-symphony/internal/ha"
-	"github.com/ainative/go-symphony/internal/orchestrator"
+	"github.com/zhoupihua/go-symphony/internal/config"
+	"github.com/zhoupihua/go-symphony/internal/ha"
+	"github.com/zhoupihua/go-symphony/internal/orchestrator"
 )
 
 // StateProvider provides read-only access to orchestrator state for the HTTP server.

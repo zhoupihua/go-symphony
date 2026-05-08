@@ -3,7 +3,7 @@ package prompt
 import (
 	"testing"
 
-	"github.com/ainative/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
 )
 
 func intPtr(v int) *int {

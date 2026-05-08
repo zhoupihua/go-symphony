@@ -325,7 +325,7 @@ WORKFLOW.md is watched for changes. When the file is modified:
 ## Module
 
 ```
-github.com/ainative/go-symphony
+github.com/zhoupihua/go-symphony
 ```
 
 Requires Go 1.26.1 or later.

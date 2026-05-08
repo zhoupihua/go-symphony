@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ainative/go-symphony/internal/tracker"
-	"github.com/ainative/go-symphony/internal/tracker/linear"
-	"github.com/ainative/go-symphony/internal/tracker/plane"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/tracker/linear"
+	"github.com/zhoupihua/go-symphony/internal/tracker/plane"
 )
 
 // handleToolCall processes a tool call request from the Codex server,

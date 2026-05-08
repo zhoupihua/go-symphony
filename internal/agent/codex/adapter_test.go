@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/agent"
-	"github.com/ainative/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/agent"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
 )
 
 // Compile-time interface checks.

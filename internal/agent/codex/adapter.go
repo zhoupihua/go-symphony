@@ -9,9 +9,9 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/ainative/go-symphony/internal/agent"
-	"github.com/ainative/go-symphony/internal/sshclient"
-	"github.com/ainative/go-symphony/internal/tracker"
+	"github.com/zhoupihua/go-symphony/internal/agent"
+	"github.com/zhoupihua/go-symphony/internal/sshclient"
+	"github.com/zhoupihua/go-symphony/internal/tracker"
 )
 
 // Compile-time interface checks.
