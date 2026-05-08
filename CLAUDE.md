@@ -2,56 +2,53 @@
 
 Symphony is a long-running automation service that polls issue trackers for work, creates isolated workspaces per issue, and runs coding agents inside those workspaces.
 
-The authoritative service specification is [SPEC.md](SPEC.md). All implementations must conform to it.
+The authoritative service specification is [SPEC.md](vendor/symphony/SPEC.md). All implementations must conform to it.
 
 ## Project Structure
 
 ```
 symphony/
-├── SPEC.md              # Language-agnostic service specification (source of truth)
-├── elixir/              # Elixir/OTP reference implementation
-│   ├── lib/             # Application code
-│   ├── test/            # ExUnit tests
-│   ├── WORKFLOW.md      # In-repo workflow contract
-│   └── AGENTS.md        # Elixir-specific AI agent instructions
-├── go/                  # Go native implementation (in progress)
-│   └── README.md
-└── docs/                # Documentation
+├── cmd/symphony/         # CLI entry point
+├── internal/             # Core packages (6 layers)
+├── docs/                 # Change documentation
+├── vendor/symphony/      # Reference implementation (submodule)
+│   ├── SPEC.md           # Language-agnostic service specification (source of truth)
+│   └── elixir/           # Elixir/OTP reference implementation
+├── SPEC-GO.md            # Go-specific spec extensions
+├── Makefile              # Build, test, lint targets
+├── README.md             # Project documentation
+└── CLAUDE.md             # AI agent instructions
 ```
 
-## Elixir Implementation
+## Reference Implementation
 
-See [elixir/AGENTS.md](elixir/AGENTS.md) for Elixir-specific conventions.
+The original openai/symphony repository is available as a submodule at `vendor/symphony/`.
 
-Key points:
-- Elixir 1.19.x (OTP 28), managed via `mise`
-- Quality gate: `make all` (format, lint, coverage, dialyzer)
-- Public functions (`def`) in `lib/` must have `@spec`
-- Config via `WORKFLOW.md` front matter, accessed through `SymphonyElixir.Config`
-- Workspace safety: never run agent commands in the source repo; workspaces must stay under configured root
+- Elixir conventions: [vendor/symphony/elixir/AGENTS.md](vendor/symphony/elixir/AGENTS.md)
+- When in doubt about spec interpretation, check `vendor/symphony/elixir/lib/`
 
 ## Go Implementation
 
-Native Go implementation of Symphony as a long-running daemon, referencing the Elixir implementation and conforming to SPEC.md.
+Native Go implementation of Symphony as a long-running daemon, conforming to SPEC.md.
 
 ### Architecture
 
-Configuration-driven composition (V5):
+Configuration-driven composition:
 - Core interfaces: `Tracker`, `Agent`/`Session`, `Elector`
 - Adapters selected by WORKFLOW.md config (`tracker.kind`, `agent.kind`)
 - Execution mode: local `os/exec` or SSH remote, selected by `worker.ssh_hosts`
-- HA: `LocalElector` (single instance, no deps) or `EtcdElector` (etcd-based leader election)
+- HA: `LocalElector` (single instance, no deps) or `RaftElector` (embedded Raft consensus)
 
 ### Six Abstraction Layers
 
 | Layer | Go Package | Responsibility |
 |-------|-----------|---------------|
-| Policy | `workflow`, `workflowstore` | WORKFLOW.md loading, file watching, prompt template |
-| Configuration | `config` | Typed getters, defaults, $VAR resolution |
+| Policy | `workflow` | WORKFLOW.md loading, file watching, prompt template |
+| Configuration | `config` | Struct with YAML tags, defaults, $VAR resolution |
 | Coordination | `orchestrator` | Poll loop, dispatch, reconcile, retry |
 | Execution | `workspace`, `agentrunner` | Workspace lifecycle, agent subprocess management |
 | Integration | `tracker` (interface), `linear`, `plane` | Issue tracker API adapters |
-| Observability | `httpserver`, `ha` | Dashboard, SSE, health, leader election |
+| Observability | `httpserver`, `ha` | Dashboard, SSE, health, leader election, state replication |
 
 ### Go Conventions
 
@@ -79,23 +76,23 @@ Configuration-driven composition (V5):
 
 ### Deployment Modes
 
-| Mode | ha.enabled | worker.ssh_hosts | etcd |
-|------|-----------|-----------------|------|
-| Local single | false | empty | no |
-| Cloud single | false | empty | no |
-| Cloud + SSH workers | false | configured | no |
-| Cloud HA | true | empty | yes |
-| Cloud HA + SSH | true | configured | yes |
+| Mode | ha.enabled | worker.ssh_hosts |
+|------|-----------|-----------------|
+| Local single | false | empty |
+| Cloud single | false | empty |
+| Cloud + SSH workers | false | configured |
+| Cloud HA | true | empty |
+| Cloud HA + SSH | true | configured |
 
 ### Dashboard
 
 - Web UI: templ + htmx + SSE (real-time updates, no JS framework)
 - Leader: serves dashboard with live orchestrator state
 - Standby: redirects to leader's dashboard
-- API: `/api/v1/state`, `/api/v1/refresh`, `/api/v1/events` (SSE), `/healthz`
+- API: `/api/v1/state`, `/api/v1/refresh`, `/api/v1/events` (SSE), `/api/v1/cluster`, `/healthz`
 
 ## Cross-Implementation Rules
 
 - Changes must not conflict with SPEC.md; if implementation alters intended behavior, update the spec in the same change
 - Both implementations should produce the same observable behavior for the same WORKFLOW.md input
-- Elixir is the reference implementation; when in doubt about spec interpretation, check `elixir/lib/`
+- Elixir is the reference implementation; when in doubt about spec interpretation, check `vendor/symphony/elixir/lib/`
