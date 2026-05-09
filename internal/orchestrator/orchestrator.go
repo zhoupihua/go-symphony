@@ -249,10 +249,11 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context, cfg config.Schema) 
 		return
 	}
 
-	// Build a lookup map from fetched issues.
+	// Build a lookup map from fetched issues, normalizing keys for
+	// case-insensitive lookup per SPEC Â§4.2.
 	fetchedMap := make(map[string]tracker.Issue, len(fetched))
 	for _, iss := range fetched {
-		fetchedMap[iss.ID] = iss
+		fetchedMap[normalizeKey(iss.ID)] = iss
 	}
 
 	// Phase 3: 3-way branch for each non-stalled running issue.

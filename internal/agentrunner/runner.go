@@ -61,7 +61,12 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 		return RunResult{}, fmt.Errorf("render prompt: %w", err)
 	}
 	if strings.TrimSpace(promptText) == "" {
-		promptText = "You are working on an issue from Linear."
+		// Capitalize tracker kind for the default prompt.
+		trackerName := r.Cfg.Tracker.Kind
+		if len(trackerName) > 0 {
+			trackerName = strings.ToUpper(trackerName[:1]) + trackerName[1:]
+		}
+		promptText = fmt.Sprintf("You are working on an issue from %s.", trackerName)
 	}
 
 	// 3. Start agent session.
@@ -132,11 +137,14 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 		}
 
 		// Check if issue is still in an active state before continuing.
+		// Per SPEC Â§16.5, tracker fetch failure must fail the worker.
 		if r.Tracker != nil {
 			stillActive, err := r.issueStillActive(ctx, issue)
 			if err != nil {
-				slog.Warn("failed to check issue state, continuing", "error", err, "issue_id", issue.ID, "issue_identifier", issue.Identifier)
-			} else if !stillActive {
+				sendEvent(eventCh, agent.EventTurnFailed, issue.ID, "issue state refresh error", nil)
+				return result, fmt.Errorf("issue state refresh error: %w", err)
+			}
+			if !stillActive {
 				slog.Info("issue left active state, stopping", "issue_id", issue.ID, "issue_identifier", issue.Identifier)
 				sendEvent(eventCh, agent.EventTurnCompleted, issue.ID, "issue left active state", nil)
 				break

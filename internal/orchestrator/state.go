@@ -166,6 +166,7 @@ func dtoToRunInfo(dto runInfoDTO) *RunInfo {
 		LastReportedInputTokens:  dto.LastRepInputTokens,
 		LastReportedOutputTokens: dto.LastRepOutputTokens,
 		LastReportedTotalTokens:  dto.LastRepTotalTokens,
+		RateLimits:               dto.RateLimits,
 	}
 }
 
@@ -517,6 +518,7 @@ func (s *State) UpdateLastError(issueID, errMsg string) {
 
 // UpdateLiveSession updates live session fields from agent events per SPEC §4.1.6.
 func (s *State) UpdateLiveSession(issueID, threadID, turnID, event, message, pid string) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	if info, ok := s.running[issueID]; ok {
 		if threadID != "" {
@@ -654,6 +656,7 @@ func (s *State) RestoreState(data []byte) error {
 		Retries        map[string]json.RawMessage `json:"retries"`
 		Completed      map[string]bool            `json:"completed"`
 		TotalRuntimeMS int64                      `json:"total_runtime_ms"`
+		RateLimits     map[string]any             `json:"rate_limits"`
 	}
 	if err := json.Unmarshal(data, &state); err != nil {
 		return fmt.Errorf("unmarshal replicated state: %w", err)
@@ -693,6 +696,19 @@ func (s *State) RestoreState(data []byte) error {
 	}
 
 	s.totalRuntimeMs = state.TotalRuntimeMS
+
+	// Restore global rate limits from the latest per-issue rate limits.
+	if state.RateLimits != nil {
+		s.rateLimits = state.RateLimits
+	} else {
+		// Fallback: use the latest rate limits from any running entry.
+		for _, info := range s.running {
+			if info.RateLimits != nil {
+				s.rateLimits = info.RateLimits
+				break
+			}
+		}
+	}
 
 	return nil
 }
