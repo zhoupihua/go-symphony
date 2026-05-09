@@ -52,8 +52,8 @@ Message handling during a turn:
 | `item/file_change_approval` | Auto-approve or reject based on `approval_policy` |
 | `exec/command_approval` | Auto-approve or reject based on `approval_policy` |
 | `apply_patch_approval` | Auto-approve or reject based on `approval_policy` |
-| `item/tool_call` | Execute dynamic tool (`linear_graphql`, `plane_rest`) |
 | `item/tool_request_user_input` | Fail the turn (not supported in automated mode) |
+| `item/tool_call` | Execute dynamic tool (`linear_graphql`, `plane_rest`) |
 
 Dynamic tools advertised at session start:
 
@@ -64,9 +64,9 @@ Unsupported tool calls return a failure response without stalling the session.
 
 Timeouts:
 
-- `read_timeout_ms` -- Per-read timeout for JSON-RPC responses (default 30s).
-- `turn_timeout_ms` -- Total turn stream timeout (default 300s).
-- `stall_timeout_ms` -- Inactivity timeout enforced by the orchestrator (default 300s, 0 disables).
+- `read_timeout_ms` -- Per-read timeout for JSON-RPC responses (default 5s).
+- `turn_timeout_ms` -- Total turn stream timeout (default 1h).
+- `stall_timeout_ms` -- Inactivity timeout enforced by the orchestrator (default 5m, 0 disables).
 
 ## Claude Code Adapter
 
@@ -125,21 +125,27 @@ elector := ha.NewLocalElector()
 // Resign() is a no-op
 ```
 
-### EtcdElector
+### RaftElector
 
-etcd-based leader election using `go.etcd.io/etcd/client/v3/concurrency`. Used when `ha.enabled` is true.
+Embedded hashicorp/raft leader election with BoltDB storage. Used when `ha.enabled` is true.
 
 Behavior:
 
 - `Campaign(ctx)` blocks until leadership is acquired or context is cancelled.
-- A background goroutine monitors the etcd session; if the session is lost, leadership is marked as lost and the `Done()` channel is closed.
-- `LeaderAddr()` queries etcd for the current leader's advertised address.
-- `Resign()` voluntarily relinquishes leadership and closes the session.
-- Election key: `/symphony/leader` (configurable).
+- A background goroutine watches the Raft `LeaderCh()` channel; if leadership is lost, the `Done()` channel is closed.
+- `LeaderAddr()` returns the current Raft leader's advertised address.
+- `Resign()` transfers leadership to another node via `LeadershipTransfer()`.
+- Raft configuration: `ha.raft_peers`, `ha.raft_dir` (BoltDB data directory), `ha.advertise_addr`.
+
+FSM state replication:
+
+- State mutations (running, claimed, retries, completed) are replicated across the Raft cluster via `ApplyCommand`.
+- FSM supports snapshot/restore for log compaction.
+- Cluster management: `AddVoter`, `RemoveServer`, `GetConfiguration`.
 
 Orchestrator behavior under HA:
 
-- The orchestrator poll loop checks `IsLeader()` before each tick.
+- The orchestrator poll loop checks `elector.Done()` and `IsLeader()` before each tick.
 - Only the leader instance dispatches work and runs reconciliation.
 - Standby instances skip poll ticks but remain ready to campaign if the leader fails.
 
@@ -154,7 +160,7 @@ Endpoints:
 | GET | `/healthz` | `handleHealthz` | Returns `ok` (plain text) |
 | GET | `/api/v1/state` | `handleState` | JSON snapshot of orchestrator state |
 | POST | `/api/v1/refresh` | `handleRefresh` | Trigger immediate poll cycle |
-| GET | `/api/v1/events` | `handleEvents` | SSE stream with state updates every 5s |
+| GET | `/api/v1/events` | `handleEvents` | SSE stream with state updates every 3s |
 
 CORS headers are set on all `/api/v1/*` endpoints (`Access-Control-Allow-Origin: *`).
 
@@ -216,7 +222,7 @@ Custom template functions:
 | Error propagation | `{:error, reason}` tuples, linked processes | `error` interface with `fmt.Errorf` wrapping |
 | Logging | `Logger` module | `log/slog` structured JSON logging |
 | Template engine | Liquid-compatible (Solid) | `text/template` with `missingkey=error` |
-| Leader election | Built-in with libcluster | `LocalElector` or `EtcdElector` via `go.etcd.io/etcd` |
+| Leader election | Built-in with libcluster | `LocalElector` or `RaftElector` via `hashicorp/raft` + BoltDB |
 | Retry timers | `Process.send_after` | `time.After` in select loop, checked on each tick |
 | Workspace path safety | String prefix check | `filepath.Join` + `IsUnderRoot` canonicalization |
 | Agent session | Single persistent Port per issue | Codex: persistent `exec.Cmd`; Claude: per-turn `exec.Cmd` |
@@ -236,7 +242,7 @@ internal/
   config/          -- Schema struct, YAML parsing, defaults, $VAR resolution, validation
   ha/              -- Elector interface
     local.go       -- LocalElector (single instance)
-    etcd.go        -- EtcdElector (etcd-based)
+    raft.go        -- RaftElector (embedded hashicorp/raft + BoltDB)
   httpserver/      -- HTTP server, handlers, SSE
   orchestrator/    -- Poll loop, dispatch, reconcile, retry, state management
   prompt/          -- Template rendering with strict variable checking
@@ -265,7 +271,7 @@ Config validation is performed at startup and fails fast with all errors joined:
 ## Security Considerations
 
 - Workspace paths are validated to stay under the configured root via canonical path comparison.
-- Workspace directory names are sanitized to `[A-Za-z0-9._-]` (other characters replaced with `-`).
+- Workspace directory names are sanitized to `[A-Za-z0-9._-]` (other characters replaced with `_`).
 - Agent subprocesses are launched with cwd set to the per-issue workspace path.
 - `$VAR` resolution reads environment variables; unresolved variables cause a startup error.
 - API tokens and secret values are not logged.
