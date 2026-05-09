@@ -122,8 +122,8 @@ All runtime behavior is configured through WORKFLOW.md YAML front matter. The pr
 | `approval_policy` | string | `auto` | Approval policy for Codex actions |
 | `thread_sandbox` | string | -- | Codex sandbox mode |
 | `turn_sandbox_policy` | string | -- | Codex turn sandbox policy |
-| `turn_timeout_ms` | int | `300000` | Turn stream timeout |
-| `read_timeout_ms` | int | `30000` | Request/response read timeout |
+| `turn_timeout_ms` | int | `3600000` | Turn stream timeout (1 hour) |
+| `read_timeout_ms` | int | `5000` | Request/response read timeout (5 seconds) |
 | `stall_timeout_ms` | int | `300000` | Inactivity timeout (0 disables) |
 
 ### agent.claude
@@ -140,22 +140,23 @@ All runtime behavior is configured through WORKFLOW.md YAML front matter. The pr
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `ssh_hosts` | []string | -- | SSH host strings for remote execution |
+| `max_concurrent_agents_per_host` | int | `0` | Per-host concurrency limit (0 = unlimited) |
 
 ### ha
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable HA leader election |
-| `etcd_endpoints` | []string | `["localhost:2379"]` | etcd cluster endpoints |
-| `lease_ttl_ms` | int | `5000` | Leader lease TTL in milliseconds |
+| `raft_peers` | []string | -- | Raft peer addresses (required when enabled) |
+| `raft_dir` | string | `<workspace.root>/raft` | Directory for Raft log and snapshots |
 | `advertise_addr` | string | -- | Address this instance advertises as leader |
 
 ### server
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `port` | int | `8080` | HTTP listen port |
-| `host` | string | `localhost` | HTTP listen host |
+| `port` | int | `8080` | HTTP listen port (0 = ephemeral) |
+| `host` | string | `127.0.0.1` | HTTP listen host |
 
 ## Supported Trackers
 
@@ -217,15 +218,17 @@ agent:
 
 ## Deployment Modes
 
-| Mode | ha.enabled | worker.ssh_hosts | etcd | Description |
+| Mode | ha.enabled | worker.ssh_hosts | Raft | Description |
 |------|-----------|-----------------|------|-------------|
 | Local single | false | empty | no | Single instance, local execution |
 | Cloud single | false | empty | no | Single instance, no SSH |
 | Cloud + SSH workers | false | configured | no | Central orchestrator, remote agents |
-| Cloud HA | true | empty | yes | etcd leader election, no SSH |
+| Cloud HA | true | empty | yes | Raft leader election, no SSH |
 | Cloud HA + SSH | true | configured | yes | Full HA with remote workers |
 
 SSH remote execution uses key-based authentication via `golang.org/x/crypto/ssh`. Workspace operations and agent commands run over SSH sessions. Codex uses persistent SSH sessions; Claude Code uses per-turn SSH commands.
+
+HA leader election uses embedded Raft consensus via `hashicorp/raft` with BoltDB storage. State mutations are replicated through the Raft log, enabling automatic failover with state recovery.
 
 ## CLI Flags
 
@@ -235,6 +238,7 @@ Usage: symphony [flags]
 Flags:
   -config string    Path to WORKFLOW.md config file (default "WORKFLOW.md")
   -addr string      HTTP listen address (overrides config)
+  -port int         HTTP listen port (overrides config, 0=ephemeral)
   -version          Print version and exit
   -log-level string Log level: debug, info, warn, error (default "info")
 ```
@@ -244,9 +248,14 @@ Flags:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/healthz` | Health check, returns `ok` |
+| GET | `/` | Human-readable dashboard (htmx + SSE) |
 | GET | `/api/v1/state` | Current orchestrator state as JSON |
+| GET | `/api/v1/issues/{identifier}` | Per-issue runtime details (404 if unknown) |
 | POST | `/api/v1/refresh` | Trigger immediate poll cycle |
 | GET | `/api/v1/events` | Server-Sent Events stream of state updates |
+| GET | `/api/v1/cluster` | Cluster membership info (HA mode) |
+| POST | `/api/v1/cluster/voters` | Add a voter to the Raft cluster |
+| DELETE | `/api/v1/cluster/servers/{id}` | Remove a server from the Raft cluster |
 
 ### State Response
 
