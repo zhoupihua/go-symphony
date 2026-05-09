@@ -68,6 +68,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate dispatch config at startup per SPEC §6.3.
+	if err := orchestrator.ValidateDispatchConfig(*cfg); err != nil {
+		slog.Error("invalid dispatch config", "error", err)
+		os.Exit(1)
+	}
+
 	// Create tracker.
 	trk, err := tracker.NewTracker(cfg.Tracker.Kind, trackerConfigMap(cfg))
 	if err != nil {

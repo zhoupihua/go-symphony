@@ -135,7 +135,7 @@ func TestBuildCommandMaxTurns(t *testing.T) {
 
 func TestCloseIsNoOp(t *testing.T) {
 	a, _ := NewAdapter(map[string]any{})
-	sess, _ := a.StartSession(context.Background(), agent.SessionOptions{})
+	sess, _ := a.StartSession(context.Background(), agent.SessionOptions{WorkspacePath: "/tmp/test"})
 
 	if err := sess.Close(); err != nil {
 		t.Errorf("Close() error = %v, want nil", err)

@@ -72,6 +72,9 @@ func Register() {
 // When opts.WorkerHost is set, it creates a persistent SSH session for bidirectional
 // JSON-RPC. Otherwise, it runs locally via os/exec.
 func (a *CodexAdapter) StartSession(ctx context.Context, opts agent.SessionOptions) (agent.Session, error) {
+	if opts.WorkspacePath == "" {
+		return nil, agent.NewAgentError(agent.ErrInvalidWorkspaceCWD, "workspace path is empty", nil)
+	}
 	if opts.WorkerHost != "" {
 		return a.startSSHSession(ctx, opts)
 	}

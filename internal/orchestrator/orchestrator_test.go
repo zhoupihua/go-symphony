@@ -443,9 +443,9 @@ func TestValidateDispatchConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateDispatchConfig(tt.cfg)
+			err := ValidateDispatchConfig(tt.cfg)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("validateDispatchConfig() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ValidateDispatchConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

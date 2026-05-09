@@ -167,7 +167,7 @@ func (o *Orchestrator) tick(ctx context.Context) {
 	o.processRetries(ctx, cfg)
 
 	// 3. Validate dispatch config before fetching candidates.
-	if err := validateDispatchConfig(cfg); err != nil {
+	if err := ValidateDispatchConfig(cfg); err != nil {
 		slog.Warn("dispatch config invalid, skipping fetch", "error", err)
 		return
 	}
@@ -183,10 +183,10 @@ func (o *Orchestrator) tick(ctx context.Context) {
 	o.dispatch(ctx, cfg, candidates)
 }
 
-// validateDispatchConfig checks that the config has the minimum required fields
+// ValidateDispatchConfig checks that the config has the minimum required fields
 // for dispatching work. This prevents wasted API calls when the config is
 // incomplete (e.g., during hot-reload of a partially-edited WORKFLOW.md).
-func validateDispatchConfig(cfg config.Schema) error {
+func ValidateDispatchConfig(cfg config.Schema) error {
 	if cfg.Tracker.Kind == "" {
 		return fmt.Errorf("tracker.kind is empty")
 	}

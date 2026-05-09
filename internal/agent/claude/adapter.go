@@ -68,6 +68,9 @@ func Register() {
 // StartSession creates a new ClaudeSession. Unlike Codex, Claude Code doesn't
 // maintain a persistent subprocess — each turn spawns a new process.
 func (a *ClaudeAdapter) StartSession(_ context.Context, opts agent.SessionOptions) (agent.Session, error) {
+	if opts.WorkspacePath == "" {
+		return nil, agent.NewAgentError(agent.ErrInvalidWorkspaceCWD, "workspace path is empty", nil)
+	}
 	return &ClaudeSession{
 		adapter: a,
 		opts:    opts,
