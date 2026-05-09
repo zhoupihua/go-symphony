@@ -2,7 +2,7 @@
 
 Symphony is a long-running automation service that polls issue trackers for work, creates isolated workspaces per issue, and runs coding agents inside those workspaces.
 
-The authoritative service specification is [SPEC.md](vendor/symphony/SPEC.md). All implementations must conform to it.
+The authoritative service specification is [SPEC.md](reference/symphony/SPEC.md). All implementations must conform to it.
 
 ## Project Structure
 
@@ -11,7 +11,7 @@ symphony/
 ├── cmd/symphony/         # CLI entry point
 ├── internal/             # Core packages (6 layers)
 ├── docs/                 # Change documentation
-├── vendor/symphony/      # Reference implementation (submodule)
+├── reference/symphony/      # Reference implementation (submodule)
 │   ├── SPEC.md           # Language-agnostic service specification (source of truth)
 │   └── elixir/           # Elixir/OTP reference implementation
 ├── SPEC-GO.md            # Go-specific spec extensions
@@ -22,10 +22,10 @@ symphony/
 
 ## Reference Implementation
 
-The original openai/symphony repository is available as a submodule at `vendor/symphony/`.
+The original openai/symphony repository is available as a submodule at `reference/symphony/`.
 
-- Elixir conventions: [vendor/symphony/elixir/AGENTS.md](vendor/symphony/elixir/AGENTS.md)
-- When in doubt about spec interpretation, check `vendor/symphony/elixir/lib/`
+- Elixir conventions: [reference/symphony/elixir/AGENTS.md](reference/symphony/elixir/AGENTS.md)
+- When in doubt about spec interpretation, check `reference/symphony/elixir/lib/`
 
 ## Go Implementation
 
@@ -95,4 +95,4 @@ Configuration-driven composition:
 
 - Changes must not conflict with SPEC.md; if implementation alters intended behavior, update the spec in the same change
 - Both implementations should produce the same observable behavior for the same WORKFLOW.md input
-- Elixir is the reference implementation; when in doubt about spec interpretation, check `vendor/symphony/elixir/lib/`
+- Elixir is the reference implementation; when in doubt about spec interpretation, check `reference/symphony/elixir/lib/`

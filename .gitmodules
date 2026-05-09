@@ -1,0 +1,3 @@
+[submodule "reference/symphony"]
+	path = reference/symphony
+	url = https://github.com/openai/symphony.git
