@@ -30,10 +30,10 @@ func NewAdapter(cfg map[string]any) (tracker.Tracker, error) {
 	projectSlug := strVal(cfg["project_slug"])
 
 	if apiKey == "" {
-		return nil, fmt.Errorf("linear adapter: api_key is required")
+		return nil, tracker.NewTrackerError(tracker.ErrMissingTrackerAPIKey, "linear adapter: api_key is required", nil)
 	}
 	if projectSlug == "" {
-		return nil, fmt.Errorf("linear adapter: project_slug is required")
+		return nil, tracker.NewTrackerError(tracker.ErrMissingTrackerProject, "linear adapter: project_slug is required", nil)
 	}
 
 	var activeStates []string

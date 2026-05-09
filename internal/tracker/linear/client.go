@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/zhoupihua/go-symphony/internal/tracker"
 )
 
 const (
@@ -31,6 +33,19 @@ type graphqlResponse struct {
 // graphqlError represents a single error from the GraphQL response.
 type graphqlError struct {
 	Message string `json:"message"`
+}
+
+// GraphQLError is returned when the GraphQL response contains top-level errors.
+// Callers can inspect both the partial data and the error details.
+type GraphQLError struct {
+	Errors []graphqlError
+}
+
+func (e *GraphQLError) Error() string {
+	if len(e.Errors) == 0 {
+		return "graphql error"
+	}
+	return fmt.Sprintf("graphql error: %s", e.Errors[0].Message)
 }
 
 // linearIssue represents a raw issue node from the Linear GraphQL API.
@@ -115,7 +130,7 @@ func (c *Client) Query(ctx context.Context, query string, variables map[string]a
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("graphql request failed: %w", err)
+		return nil, tracker.NewTrackerError(tracker.ErrAPIRequest, "graphql request failed", err)
 	}
 	defer resp.Body.Close()
 
@@ -125,16 +140,16 @@ func (c *Client) Query(ctx context.Context, query string, variables map[string]a
 			slog.Int("status", resp.StatusCode),
 			slog.String("body", truncate(string(respBody), 1000)),
 		)
-		return nil, fmt.Errorf("linear api status %d", resp.StatusCode)
+		return nil, tracker.NewTrackerError(tracker.ErrAPIStatus, fmt.Sprintf("linear api status %d", resp.StatusCode), nil)
 	}
 
 	var gqlResp graphqlResponse
 	if err := json.NewDecoder(resp.Body).Decode(&gqlResp); err != nil {
-		return nil, fmt.Errorf("decode graphql response: %w", err)
+		return nil, tracker.NewTrackerError(tracker.ErrUnknownPayload, "decode graphql response", err)
 	}
 
 	if len(gqlResp.Errors) > 0 {
-		return nil, fmt.Errorf("graphql error: %s", gqlResp.Errors[0].Message)
+		return gqlResp.Data, tracker.NewTrackerError(tracker.ErrGraphQLErrors, "graphql errors in response", &GraphQLError{Errors: gqlResp.Errors})
 	}
 
 	return gqlResp.Data, nil
@@ -154,6 +169,7 @@ query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first:
       priority
       state { name }
       url
+	      branchName
       labels { nodes { name } }
       inverseRelations(first: $relationFirst) {
         nodes {
@@ -230,7 +246,7 @@ query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first:
 			break
 		}
 		if pi.EndCursor == "" {
-			return nil, fmt.Errorf("linear missing end cursor")
+			return nil, tracker.NewTrackerError(tracker.ErrMissingEndCursor, "linear missing end cursor in paginated response", nil)
 		}
 		afterCursor = pi.EndCursor
 	}
@@ -251,6 +267,7 @@ query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!)
       priority
       state { name }
       url
+	      branchName
       labels { nodes { name } }
       inverseRelations(first: $relationFirst) {
         nodes {

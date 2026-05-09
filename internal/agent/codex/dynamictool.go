@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -109,6 +110,30 @@ func executeLinearGraphQL(ctx context.Context, rawClient any, input json.RawMess
 	}
 
 	data, err := client.Query(ctx, args.Query, args.Variables)
+
+	// Check for GraphQL errors — preserve response body per SPEC §10.5.
+	var gqlErr *linear.GraphQLError
+	if errors.As(err, &gqlErr) {
+		// GraphQL errors present -> success=false but preserve the response body.
+		body := data
+		if body == nil {
+			body = map[string]any{}
+		}
+		// Include errors in the output for debugging.
+		body["errors"] = gqlErr.Errors
+		resultJSON, marshalErr := json.Marshal(body)
+		if marshalErr != nil {
+			return &ToolResult{
+				Success: false,
+				Output:  fmt.Sprintf("linear_graphql: marshal error response: %v", marshalErr),
+			}, nil
+		}
+		return &ToolResult{
+			Success: false,
+			Output:  string(resultJSON),
+		}, nil
+	}
+
 	if err != nil {
 		return &ToolResult{
 			Success: false,

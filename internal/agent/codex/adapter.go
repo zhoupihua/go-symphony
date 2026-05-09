@@ -35,9 +35,9 @@ func NewAdapter(cfg map[string]any) (agent.Agent, error) {
 	a := &CodexAdapter{
 		command:        "codex app-server",
 		approvalPolicy: "auto",
-		readTimeout:    30 * time.Second,
-		stallTimeout:   2 * time.Minute,
-		turnTimeout:    10 * time.Minute,
+		readTimeout:    5 * time.Second,
+		stallTimeout:   5 * time.Minute,
+		turnTimeout:    1 * time.Hour,
 	}
 
 	if v, ok := cfg["command"].(string); ok && v != "" {
@@ -94,7 +94,7 @@ func (a *CodexAdapter) startLocalSession(ctx context.Context, opts agent.Session
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("codex: start process: %w", err)
+		return nil, agent.NewAgentError(agent.ErrCodexNotFound, "codex: start process", err)
 	}
 
 	enc := NewEncoder(stdinPipe)
@@ -129,7 +129,7 @@ func (a *CodexAdapter) startLocalSession(ctx context.Context, opts agent.Session
 	if initResp.Error != nil {
 		stdinPipe.Close()
 		cmd.Process.Kill()
-		return nil, fmt.Errorf("codex: initialize failed: %s", initResp.Error.Message)
+		return nil, agent.NewAgentError(agent.ErrSessionStartup, fmt.Sprintf("codex: initialize failed: %s", initResp.Error.Message), nil)
 	}
 
 	// 3. Send initialized notification.
@@ -176,7 +176,7 @@ func (a *CodexAdapter) startLocalSession(ctx context.Context, opts agent.Session
 	if threadResp.Error != nil {
 		stdinPipe.Close()
 		cmd.Process.Kill()
-		return nil, fmt.Errorf("codex: thread/start failed: %s", threadResp.Error.Message)
+		return nil, agent.NewAgentError(agent.ErrSessionStartup, fmt.Sprintf("codex: thread/start failed: %s", threadResp.Error.Message), nil)
 	}
 
 	// Extract threadId from result.
@@ -405,6 +405,7 @@ func (s *CodexSession) RunTurn(ctx context.Context, prompt string, opts agent.Tu
 		ThreadID:       s.threadID,
 		Input:          prompt,
 		CWD:            s.opts.WorkspacePath,
+		Title:          fmt.Sprintf("%s: %s", s.opts.Issue.Identifier, s.opts.Issue.Title),
 		ApprovalPolicy: policy,
 		SandboxPolicy:  s.sandbox,
 	})
@@ -431,7 +432,7 @@ func (s *CodexSession) RunTurn(ctx context.Context, prompt string, opts agent.Tu
 		// Check context cancellation.
 		select {
 		case <-turnCtx.Done():
-			return agent.TurnResult{}, fmt.Errorf("codex: turn cancelled: %w", turnCtx.Err())
+			return agent.TurnResult{}, agent.NewAgentError(agent.ErrTurnCancelled, "codex: turn cancelled", turnCtx.Err())
 		default:
 		}
 
@@ -496,10 +497,10 @@ func (s *CodexSession) handleNotification(_ context.Context, msg *Message) (agen
 				errMsg = params.Error
 			}
 		}
-		return agent.TurnResult{}, true, fmt.Errorf("codex: %s", errMsg)
+		return agent.TurnResult{}, true, agent.NewAgentError(agent.ErrTurnFailed, fmt.Sprintf("codex: %s", errMsg), nil)
 
 	case MethodTurnCancelled:
-		return agent.TurnResult{}, true, fmt.Errorf("codex: turn cancelled")
+		return agent.TurnResult{}, true, agent.NewAgentError(agent.ErrTurnCancelled, "codex: turn cancelled", nil)
 
 	default:
 		// Ignore other notifications.
@@ -547,6 +548,14 @@ func (s *CodexSession) handleServerRequest(ctx context.Context, msg *Message) er
 		}
 		return nil
 	}
+}
+
+// PID returns the subprocess PID if available, or 0.
+func (s *CodexSession) PID() int {
+	if s.cmd != nil && s.cmd.Process != nil {
+		return s.cmd.Process.Pid
+	}
+	return 0
 }
 
 // Close terminates the Codex subprocess and closes any SSH connection.
@@ -601,7 +610,7 @@ func decodeWithTimeout(dec *Decoder, timeout time.Duration) (*Message, error) {
 
 	select {
 	case <-timer.C:
-		return nil, fmt.Errorf("read timeout after %v", timeout)
+		return nil, agent.NewAgentError(agent.ErrResponseTimeout, fmt.Sprintf("read timeout after %v", timeout), nil)
 	case r := <-ch:
 		return r.msg, r.err
 	}
@@ -632,7 +641,7 @@ func decodeWithTimeoutCtx(ctx context.Context, dec *Decoder, timeout time.Durati
 	case r := <-ch:
 		return r.msg, r.err
 	case <-timer.C:
-		return nil, fmt.Errorf("read timeout after %v", timeout)
+		return nil, agent.NewAgentError(agent.ErrResponseTimeout, fmt.Sprintf("read timeout after %v", timeout), nil)
 	}
 }
 

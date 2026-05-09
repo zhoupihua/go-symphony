@@ -86,6 +86,8 @@ func Remove(ctx context.Context, path, root, beforeRemoveHook string, hookTimeou
 //   - after_create and before_run: abort (return error)
 //   - after_run and before_remove: log and ignore
 func RunHook(ctx context.Context, script, workspacePath string, timeout time.Duration) error {
+	slog.Info("hook start", "path", workspacePath, "timeout", timeout)
+
 	// Create context with timeout
 	hookCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -98,6 +100,13 @@ func RunHook(ctx context.Context, script, workspacePath string, timeout time.Dur
 	cmd.Stderr = &output
 
 	err := cmd.Run()
+
+	// Log hook output, truncated to 10KB per SPEC §6.2.
+	out := output.String()
+	if len(out) > 0 {
+		slog.Info("hook output", "path", workspacePath, "output", truncateString(out, 10*1024))
+	}
+
 	if err != nil {
 		if hookCtx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("hook timed out after %s: %w", timeout, err)
@@ -106,4 +115,12 @@ func RunHook(ctx context.Context, script, workspacePath string, timeout time.Dur
 	}
 
 	return nil
+}
+
+// truncateString truncates s to maxLen bytes, appending "..." if truncated.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }

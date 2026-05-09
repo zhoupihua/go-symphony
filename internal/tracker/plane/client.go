@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/zhoupihua/go-symphony/internal/tracker"
 )
 
 // Client wraps HTTP requests to Plane's REST API.
@@ -66,7 +68,7 @@ func (c *Client) Get(ctx context.Context, path string) (map[string]any, error) {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", path, err)
+		return nil, tracker.NewTrackerError(tracker.ErrAPIRequest, fmt.Sprintf("GET %s", path), err)
 	}
 	defer resp.Body.Close()
 
@@ -76,7 +78,7 @@ func (c *Client) Get(ctx context.Context, path string) (map[string]any, error) {
 
 	var result map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode GET %s response: %w", path, err)
+		return nil, tracker.NewTrackerError(tracker.ErrUnknownPayload, fmt.Sprintf("decode GET %s response", path), err)
 	}
 	return result, nil
 }
@@ -111,7 +113,7 @@ func (c *Client) doWithBody(ctx context.Context, method, path string, body any) 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", method, path, err)
+		return nil, tracker.NewTrackerError(tracker.ErrAPIRequest, fmt.Sprintf("%s %s", method, path), err)
 	}
 	defer resp.Body.Close()
 
@@ -121,7 +123,7 @@ func (c *Client) doWithBody(ctx context.Context, method, path string, body any) 
 
 	var result map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode %s %s response: %w", method, path, err)
+		return nil, tracker.NewTrackerError(tracker.ErrUnknownPayload, fmt.Sprintf("decode %s %s response", method, path), err)
 	}
 	return result, nil
 }
@@ -274,7 +276,14 @@ func checkStatus(resp *http.Response) error {
 		return nil
 	}
 	body, _ := io.ReadAll(resp.Body)
-	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	return tracker.NewTrackerError(tracker.ErrAPIStatus, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 500)), nil)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // strVal extracts a string value from a map[string]any, returning "" for non-strings.

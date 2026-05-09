@@ -27,9 +27,19 @@ type RunInfo struct {
 	LastError     string
 	Phase         string
 
+	// Live session fields per SPEC §4.1.6.
+	ThreadID        string
+	TurnID          string
+	LastCodexEvent  string
+	LastCodexTS     time.Time
+	LastCodexMsg    string
+	CodexServerPID  string
+
 	LastReportedInputTokens  int64
 	LastReportedOutputTokens int64
 	LastReportedTotalTokens  int64
+
+	RateLimits map[string]any
 }
 
 // RetryEntry tracks a pending retry for an issue.
@@ -38,6 +48,7 @@ type RetryEntry struct {
 	Attempt    int
 	FireAt     time.Time
 	IsContinue bool
+	Error      string
 }
 
 // runInfoDTO is the serializable form of RunInfo for state replication.
@@ -61,9 +72,16 @@ type runInfoDTO struct {
 	SessionID    string   `json:"session_id"`
 	LastError    string   `json:"last_error"`
 	Phase        string   `json:"phase"`
+	ThreadID     string   `json:"thread_id,omitempty"`
+	TurnID       string   `json:"turn_id,omitempty"`
+	LastCodexEvent string `json:"last_codex_event,omitempty"`
+	LastCodexTS  string   `json:"last_codex_ts,omitempty"`
+	LastCodexMsg string   `json:"last_codex_msg,omitempty"`
+	CodexServerPID string `json:"codex_server_pid,omitempty"`
 	LastRepInputTokens  int64 `json:"last_rep_input_tokens"`
 	LastRepOutputTokens int64 `json:"last_rep_output_tokens"`
 	LastRepTotalTokens  int64 `json:"last_rep_total_tokens"`
+	RateLimits          map[string]any `json:"rate_limits,omitempty"`
 }
 
 // retryEntryDTO is the serializable form of RetryEntry for state replication.
@@ -74,6 +92,7 @@ type retryEntryDTO struct {
 	Attempt    int    `json:"attempt"`
 	FireAt     string `json:"fire_at"`
 	IsContinue bool   `json:"is_continue"`
+	Error      string `json:"error"`
 }
 
 func runInfoToDTO(info *RunInfo) runInfoDTO {
@@ -97,15 +116,23 @@ func runInfoToDTO(info *RunInfo) runInfoDTO {
 		SessionID:    info.SessionID,
 		LastError:    info.LastError,
 		Phase:        info.Phase,
+		ThreadID:     info.ThreadID,
+		TurnID:       info.TurnID,
+		LastCodexEvent: info.LastCodexEvent,
+		LastCodexTS:   info.LastCodexTS.UTC().Format(time.RFC3339Nano),
+		LastCodexMsg: info.LastCodexMsg,
+		CodexServerPID: info.CodexServerPID,
 		LastRepInputTokens:  info.LastReportedInputTokens,
 		LastRepOutputTokens: info.LastReportedOutputTokens,
 		LastRepTotalTokens:  info.LastReportedTotalTokens,
+		RateLimits:          info.RateLimits,
 	}
 }
 
 func dtoToRunInfo(dto runInfoDTO) *RunInfo {
 	startedAt, _ := time.Parse(time.RFC3339Nano, dto.StartedAt)
 	lastActivity, _ := time.Parse(time.RFC3339Nano, dto.LastActivity)
+	lastCodexTS, _ := time.Parse(time.RFC3339Nano, dto.LastCodexTS)
 	return &RunInfo{
 		Issue: tracker.Issue{
 			ID:         dto.IssueID,
@@ -127,9 +154,15 @@ func dtoToRunInfo(dto runInfoDTO) *RunInfo {
 			OutputTokens: dto.OutputTokens,
 			TotalTokens:  dto.TotalTokens,
 		},
-		SessionID:    dto.SessionID,
-		LastError:    dto.LastError,
-		Phase:        dto.Phase,
+		SessionID:      dto.SessionID,
+		LastError:      dto.LastError,
+		Phase:          dto.Phase,
+		ThreadID:       dto.ThreadID,
+		TurnID:         dto.TurnID,
+		LastCodexEvent: dto.LastCodexEvent,
+		LastCodexTS:    lastCodexTS,
+		LastCodexMsg:   dto.LastCodexMsg,
+		CodexServerPID: dto.CodexServerPID,
 		LastReportedInputTokens:  dto.LastRepInputTokens,
 		LastReportedOutputTokens: dto.LastRepOutputTokens,
 		LastReportedTotalTokens:  dto.LastRepTotalTokens,
@@ -144,6 +177,7 @@ func retryEntryToDTO(entry *RetryEntry) retryEntryDTO {
 		Attempt:    entry.Attempt,
 		FireAt:     entry.FireAt.UTC().Format(time.RFC3339Nano),
 		IsContinue: entry.IsContinue,
+		Error:      entry.Error,
 	}
 }
 
@@ -158,7 +192,13 @@ func dtoToRetryEntry(dto retryEntryDTO) *RetryEntry {
 		Attempt:    dto.Attempt,
 		FireAt:     fireAt,
 		IsContinue: dto.IsContinue,
+		Error:      dto.Error,
 	}
+}
+
+// normalizeKey lowercases an issue ID for case-insensitive map lookups per SPEC §4.2.
+func normalizeKey(id string) string {
+	return strings.ToLower(id)
 }
 
 // State holds the orchestrator's runtime state.
@@ -169,6 +209,9 @@ type State struct {
 	retryAttempts  map[string]*RetryEntry
 	completed      map[string]struct{}
 	totalRuntimeMs int64
+	totalInput     int64
+	totalOutput    int64
+	totalTokens    int64
 	rateLimits     map[string]any
 	replicator     ha.StateReplicator
 }
@@ -225,6 +268,7 @@ func (s *State) Running() map[string]*RunInfo {
 
 // SetRunning adds or updates a running entry.
 func (s *State) SetRunning(issueID string, info *RunInfo) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	s.running[issueID] = info
 	s.mu.Unlock()
@@ -233,6 +277,7 @@ func (s *State) SetRunning(issueID string, info *RunInfo) {
 
 // RemoveRunning removes a running entry and returns it.
 func (s *State) RemoveRunning(issueID string) (*RunInfo, bool) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	info, ok := s.running[issueID]
 	if ok {
@@ -247,6 +292,7 @@ func (s *State) RemoveRunning(issueID string) (*RunInfo, bool) {
 
 // IsRunning returns whether an issue is currently being processed.
 func (s *State) IsRunning(issueID string) bool {
+	issueID = normalizeKey(issueID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	_, ok := s.running[issueID]
@@ -284,6 +330,7 @@ func (s *State) RunningByHost() map[string]int {
 
 // Claim marks an issue as claimed for dispatch/retry.
 func (s *State) Claim(issueID string) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	s.claimed[issueID] = struct{}{}
 	s.mu.Unlock()
@@ -292,6 +339,7 @@ func (s *State) Claim(issueID string) {
 
 // IsClaimed returns whether an issue is claimed.
 func (s *State) IsClaimed(issueID string) bool {
+	issueID = normalizeKey(issueID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	_, ok := s.claimed[issueID]
@@ -300,6 +348,7 @@ func (s *State) IsClaimed(issueID string) bool {
 
 // ReleaseClaim removes a claim on an issue.
 func (s *State) ReleaseClaim(issueID string) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	delete(s.claimed, issueID)
 	s.mu.Unlock()
@@ -308,6 +357,7 @@ func (s *State) ReleaseClaim(issueID string) {
 
 // SetRetry sets a pending retry for an issue.
 func (s *State) SetRetry(issueID string, entry *RetryEntry) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	s.retryAttempts[issueID] = entry
 	s.mu.Unlock()
@@ -316,6 +366,7 @@ func (s *State) SetRetry(issueID string, entry *RetryEntry) {
 
 // RemoveRetry removes a pending retry and returns it.
 func (s *State) RemoveRetry(issueID string) (*RetryEntry, bool) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	entry, ok := s.retryAttempts[issueID]
 	if ok {
@@ -348,6 +399,7 @@ func (s *State) RetryCount() int {
 
 // RunningIssue returns the RunInfo for a specific issue, or nil if not running.
 func (s *State) RunningIssue(issueID string) *RunInfo {
+	issueID = normalizeKey(issueID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.running[issueID]
@@ -355,6 +407,7 @@ func (s *State) RunningIssue(issueID string) *RunInfo {
 
 // MarkCompleted marks an issue as successfully completed.
 func (s *State) MarkCompleted(issueID string) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	s.completed[issueID] = struct{}{}
 	s.mu.Unlock()
@@ -363,6 +416,7 @@ func (s *State) MarkCompleted(issueID string) {
 
 // IsCompleted returns whether an issue has been completed.
 func (s *State) IsCompleted(issueID string) bool {
+	issueID = normalizeKey(issueID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	_, ok := s.completed[issueID]
@@ -371,6 +425,7 @@ func (s *State) IsCompleted(issueID string) bool {
 
 // UpdateActivity updates the last activity timestamp for a running issue.
 func (s *State) UpdateActivity(issueID string) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	if info, ok := s.running[issueID]; ok {
 		info.LastActivity = time.Now()
@@ -383,6 +438,7 @@ func (s *State) UpdateActivity(issueID string) {
 
 // UpdateUsage updates the usage counters for a running issue using delta tracking.
 func (s *State) UpdateUsage(issueID string, usage agent.UsageReport) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	if info, ok := s.running[issueID]; ok {
 		inputDelta := usage.InputTokens - info.LastReportedInputTokens
@@ -412,6 +468,7 @@ func (s *State) UpdateUsage(issueID string, usage agent.UsageReport) {
 
 // UpdateIssue replaces the Issue snapshot for a running entry.
 func (s *State) UpdateIssue(issueID string, issue tracker.Issue) {
+	issueID = normalizeKey(issueID)
 	s.mu.Lock()
 	if info, ok := s.running[issueID]; ok {
 		info.Issue = issue
@@ -458,6 +515,33 @@ func (s *State) UpdateLastError(issueID, errMsg string) {
 	}
 }
 
+// UpdateLiveSession updates live session fields from agent events per SPEC §4.1.6.
+func (s *State) UpdateLiveSession(issueID, threadID, turnID, event, message, pid string) {
+	s.mu.Lock()
+	if info, ok := s.running[issueID]; ok {
+		if threadID != "" {
+			info.ThreadID = threadID
+		}
+		if turnID != "" {
+			info.TurnID = turnID
+		}
+		if event != "" {
+			info.LastCodexEvent = event
+			info.LastCodexTS = time.Now()
+		}
+		if message != "" {
+			info.LastCodexMsg = message
+		}
+		if pid != "" {
+			info.CodexServerPID = pid
+		}
+		s.mu.Unlock()
+		s.replicateRunning(issueID, info)
+	} else {
+		s.mu.Unlock()
+	}
+}
+
 // AddRuntimeMs adds ended-session runtime to the cumulative total.
 func (s *State) AddRuntimeMs(ms int64) {
 	s.mu.Lock()
@@ -467,6 +551,14 @@ func (s *State) AddRuntimeMs(ms int64) {
 	s.replicateRuntime()
 }
 
+// AddTokens accumulates ended-session token counts into the aggregate totals.
+func (s *State) AddTokens(input, output, total int64) {
+	s.mu.Lock()
+	s.totalInput += input
+	s.totalOutput += output
+	s.totalTokens += total
+	s.mu.Unlock()
+}
 func (s *State) replicateRuntime() {
 	if s.replicator == nil {
 		return
@@ -499,13 +591,45 @@ func (s *State) TotalRuntimeSeconds() float64 {
 	}
 	return total
 }
+// CodexTotals returns aggregate token counts and runtime seconds.
+// Includes cumulative ended-session totals plus active session elapsed time.
+func (s *State) CodexTotals() (inputTokens, outputTokens, totalTokens int64, secondsRunning float64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	inputTokens = s.totalInput
+	outputTokens = s.totalOutput
+	totalTokens = s.totalTokens
+	secondsRunning = float64(s.totalRuntimeMs) / 1000.0
+	now := time.Now()
+	for _, info := range s.running {
+		secondsRunning += now.Sub(info.StartedAt).Seconds()
+		inputTokens += info.TotalUsage.InputTokens
+		outputTokens += info.TotalUsage.OutputTokens
+		totalTokens += info.TotalUsage.TotalTokens
+	}
+	return
+}
 
-// SetRateLimits updates the latest rate-limit payload.
+// SetRateLimitsForIssue updates the rate-limit payload for a specific running issue.
+func (s *State) SetRateLimitsForIssue(issueID string, limits map[string]any) {
+	issueID = normalizeKey(issueID)
+	s.mu.Lock()
+	if info, ok := s.running[issueID]; ok {
+		info.RateLimits = limits
+		s.rateLimits = limits // keep global latest for dashboard
+		s.mu.Unlock()
+		s.replicateRunning(issueID, info)
+	} else {
+		s.rateLimits = limits
+		s.mu.Unlock()
+	}
+}
+
+// SetRateLimits updates the latest rate-limit payload (global fallback).
 func (s *State) SetRateLimits(limits map[string]any) {
 	s.mu.Lock()
 	s.rateLimits = limits
 	s.mu.Unlock()
-	// Rate limits are transient; skip replication.
 }
 
 // RateLimits returns the latest rate-limit payload.

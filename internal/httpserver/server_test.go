@@ -53,6 +53,10 @@ func (m *mockStateProvider) TotalRuntimeSeconds() float64 {
 	return 0
 }
 
+	func (m *mockStateProvider) CodexTotals() (int64, int64, int64, float64) {
+		return 0, 0, 0, 0
+	}
+
 func (m *mockStateProvider) RateLimits() map[string]any {
 	return nil
 }
@@ -173,12 +177,20 @@ func TestStateEndpoint(t *testing.T) {
 	if !body.Leader {
 		t.Error("expected leader=true")
 	}
-	if body.RunningCount != 1 {
-		t.Errorf("expected running_count=1, got %d", body.RunningCount)
+	if body.Counts.Running != 1 {
+		t.Errorf("expected running_count=1, got %d", body.Counts.Running)
 	}
-	info, ok := body.Running["issue-1"]
-	if !ok {
-		t.Fatal("expected issue-1 in running map")
+	var info runInfoJSON
+	found := false
+	for _, r := range body.Running {
+		if r.IssueID == "issue-1" {
+			info = r
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected issue-1 in running list")
 	}
 	if info.Identifier != "ENG-1" {
 		t.Errorf("expected identifier=ENG-1, got %q", info.Identifier)
@@ -230,11 +242,11 @@ func TestStateEndpointEmpty(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	if body.RunningCount != 0 {
-		t.Errorf("expected running_count=0, got %d", body.RunningCount)
+	if body.Counts.Running != 0 {
+		t.Errorf("expected running_count=0, got %d", body.Counts.Running)
 	}
 	if len(body.Running) != 0 {
-		t.Errorf("expected empty running map, got %d entries", len(body.Running))
+		t.Errorf("expected empty running list, got %d entries", len(body.Running))
 	}
 }
 
@@ -400,12 +412,18 @@ func TestStateEndpointNilLabels(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	info := body.Running["issue-2"]
-	if info.Labels == nil {
+	var info2 runInfoJSON
+	for _, r := range body.Running {
+		if r.IssueID == "issue-2" {
+			info2 = r
+			break
+		}
+	}
+	if info2.Labels == nil {
 		t.Error("expected labels to be empty array, not null")
 	}
-	if len(info.Labels) != 0 {
-		t.Errorf("expected empty labels array, got %v", info.Labels)
+	if len(info2.Labels) != 0 {
+		t.Errorf("expected empty labels array, got %v", info2.Labels)
 	}
 }
 

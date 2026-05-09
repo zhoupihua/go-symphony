@@ -77,7 +77,7 @@ func TestQuery_GraphQLErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for GraphQL errors response")
 	}
-	if err.Error() != "graphql error: something went wrong" {
+	if err.Error() != "graphql_errors: graphql errors in response: graphql error: something went wrong" {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }

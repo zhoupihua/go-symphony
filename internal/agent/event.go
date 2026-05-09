@@ -30,6 +30,7 @@ type Event struct {
 	Usage      *UsageReport
 	RateLimits map[string]any // latest rate-limit payload from agent
 	Timestamp  time.Time
+	PID        string // subprocess PID, if available
 }
 
 // UsageReport tracks token consumption for an agent turn.

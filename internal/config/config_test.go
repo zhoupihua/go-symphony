@@ -566,8 +566,8 @@ func TestResolveEnvVars(t *testing.T) {
 		if !strings.Contains(err.Error(), "NONEXISTENT_VAR_XYZ") {
 			t.Errorf("error %q should mention var name NONEXISTENT_VAR_XYZ", err.Error())
 		}
-		if !strings.Contains(err.Error(), "Tracker.APIKey") {
-			t.Errorf("error %q should mention field path Tracker.APIKey", err.Error())
+		if !strings.Contains(err.Error(), "tracker.api_key") {
+			t.Errorf("error %q should mention field path tracker.api_key", err.Error())
 		}
 	})
 
@@ -588,15 +588,12 @@ func TestResolveEnvVars(t *testing.T) {
 		}
 	})
 
-	t.Run("resolves nested struct field", func(t *testing.T) {
-		t.Setenv("TEST_SLUG", "my-resolved-slug")
+	t.Run("resolves workspace root", func(t *testing.T) {
+		t.Setenv("TEST_ROOT", "/tmp/symphony-test")
 
 		s := &Schema{
-			Tracker: TrackerConfig{
-				Kind: "linear",
-				Linear: LinearConfig{
-					ProjectSlug: "$TEST_SLUG",
-				},
+			Workspace: WorkspaceConfig{
+				Root: "$TEST_ROOT",
 			},
 		}
 
@@ -604,17 +601,17 @@ func TestResolveEnvVars(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveEnvVars() error = %v", err)
 		}
-		if s.Tracker.Linear.ProjectSlug != "my-resolved-slug" {
-			t.Errorf("Tracker.Linear.ProjectSlug = %q, want %q", s.Tracker.Linear.ProjectSlug, "my-resolved-slug")
+		if s.Workspace.Root != "/tmp/symphony-test" {
+			t.Errorf("Workspace.Root = %q, want %q", s.Workspace.Root, "/tmp/symphony-test")
 		}
 	})
 
-	t.Run("resolves string in slice", func(t *testing.T) {
-		t.Setenv("TEST_SSH_HOST", "worker.example.com:22")
+	t.Run("resolves raft dir and skips non-whitelisted fields", func(t *testing.T) {
+		t.Setenv("TEST_RAFT_DIR", "/data/raft")
 
 		s := &Schema{
-			Worker: WorkerConfig{
-				SSHHosts: []string{"$TEST_SSH_HOST", "static-host:22"},
+			HA: HAConfig{
+				RaftDir: "$TEST_RAFT_DIR",
 			},
 		}
 
@@ -622,14 +619,24 @@ func TestResolveEnvVars(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveEnvVars() error = %v", err)
 		}
-		if len(s.Worker.SSHHosts) != 2 {
-			t.Fatalf("Worker.SSHHosts len = %d, want 2", len(s.Worker.SSHHosts))
+		if s.HA.RaftDir != "/data/raft" {
+			t.Errorf("HA.RaftDir = %q, want %q", s.HA.RaftDir, "/data/raft")
 		}
-		if s.Worker.SSHHosts[0] != "worker.example.com:22" {
-			t.Errorf("Worker.SSHHosts[0] = %q, want %q", s.Worker.SSHHosts[0], "worker.example.com:22")
+
+		// Verify non-whitelisted fields are NOT resolved
+		s2 := &Schema{
+			Tracker: TrackerConfig{
+				Kind: "linear",
+				Linear: LinearConfig{
+					ProjectSlug: "$TEST_RAFT_DIR",
+				},
+			},
 		}
-		if s.Worker.SSHHosts[1] != "static-host:22" {
-			t.Errorf("Worker.SSHHosts[1] = %q, want %q", s.Worker.SSHHosts[1], "static-host:22")
+		if err := resolveEnvVars(s2); err != nil {
+			t.Fatalf("resolveEnvVars() unexpected error: %v", err)
+		}
+		if s2.Tracker.Linear.ProjectSlug != "$TEST_RAFT_DIR" {
+			t.Errorf("ProjectSlug should NOT be resolved, got %q", s2.Tracker.Linear.ProjectSlug)
 		}
 	})
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"time"
 
@@ -39,7 +38,7 @@ type Runner struct {
 func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, eventCh chan<- agent.Event) (RunResult, error) {
 	// Derive workspace path from config root + sanitized key.
 	wsRoot := r.Cfg.Workspace.Root
-	sanitizedKey := SanitizeKey(issue.Identifier)
+	sanitizedKey := workspace.SanitizeKey(issue.Identifier)
 	wsPath := wsRoot + "/" + sanitizedKey
 
 	// 1. Run before_run hook.
@@ -77,6 +76,15 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 		return RunResult{}, fmt.Errorf("start session: %w", err)
 	}
 	defer sess.Close()
+
+	// Emit session started event with PID if available.
+	var pidStr string
+	if pider, ok := sess.(interface{ PID() int }); ok {
+		if pid := pider.PID(); pid > 0 {
+			pidStr = fmt.Sprintf("%d", pid)
+		}
+	}
+	sendEvent(eventCh, agent.EventSessionStarted, issue.ID, "session started", nil, withPID(pidStr))
 
 	// 4. Turn loop.
 	maxTurns := r.Cfg.Agent.MaxTurns
@@ -127,9 +135,9 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 		if r.Tracker != nil {
 			stillActive, err := r.issueStillActive(ctx, issue)
 			if err != nil {
-				slog.Warn("failed to check issue state, continuing", "error", err, "issue", issue.ID)
+				slog.Warn("failed to check issue state, continuing", "error", err, "issue_id", issue.ID, "issue_identifier", issue.Identifier)
 			} else if !stillActive {
-				slog.Info("issue left active state, stopping", "issue", issue.ID)
+				slog.Info("issue left active state, stopping", "issue_id", issue.ID, "issue_identifier", issue.Identifier)
 				sendEvent(eventCh, agent.EventTurnCompleted, issue.ID, "issue left active state", nil)
 				break
 			}
@@ -152,19 +160,6 @@ func (r *Runner) Run(ctx context.Context, issue tracker.Issue, attempt int, even
 	}
 
 	return result, nil
-}
-
-// SanitizeKey is a local wrapper for tracker key sanitization.
-func SanitizeKey(s string) string {
-	var b []byte
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
-			b = append(b, byte(r))
-		} else {
-			b = append(b, '_')
-		}
-	}
-	return string(b)
 }
 
 // sshConfigFromHost parses a "host:port" string into an sshclient.Config.
@@ -192,7 +187,13 @@ func (r *Runner) issueStillActive(ctx context.Context, issue tracker.Issue) (boo
 		return false, nil
 	}
 
-	return slices.Contains(activeStates, issues[0].State), nil
+	lower := strings.ToLower(issues[0].State)
+	for _, s := range activeStates {
+		if strings.ToLower(s) == lower {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // hookTimeout returns the configured hook timeout or a sensible default.
@@ -222,6 +223,9 @@ func agentConfigMap(cfg config.Schema) map[string]any {
 		}
 		if cfg.Agent.Codex.ThreadSandbox != "" {
 			m["thread_sandbox"] = cfg.Agent.Codex.ThreadSandbox
+		}
+		if cfg.Agent.Codex.TurnSandboxPolicy != "" {
+			m["turn_sandbox_policy"] = cfg.Agent.Codex.TurnSandboxPolicy
 		}
 		return m
 	case "claude":
@@ -275,4 +279,9 @@ func withSessionID(sid string) func(*agent.Event) {
 // withRateLimits returns an event option that sets the rate limits.
 func withRateLimits(limits map[string]any) func(*agent.Event) {
 	return func(e *agent.Event) { e.RateLimits = limits }
+}
+
+// withPID returns an event option that sets the subprocess PID.
+func withPID(pid string) func(*agent.Event) {
+	return func(e *agent.Event) { e.PID = pid }
 }

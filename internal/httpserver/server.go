@@ -33,6 +33,9 @@ type StateProvider interface {
 	// TotalRuntimeSeconds returns aggregate runtime in seconds.
 	TotalRuntimeSeconds() float64
 
+	// CodexTotals returns aggregate token counts and runtime seconds.
+	CodexTotals() (inputTokens, outputTokens, totalTokens int64, secondsRunning float64)
+
 	// RateLimits returns the latest rate-limit payload.
 	RateLimits() map[string]any
 }

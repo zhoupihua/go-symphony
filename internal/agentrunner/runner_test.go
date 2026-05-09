@@ -128,11 +128,19 @@ func TestRunnerSingleTurnCompletion(t *testing.T) {
 
 	select {
 	case evt := <-eventCh:
-		if evt.Type != agent.EventTurnCompleted {
-			t.Errorf("Event type = %q, want %q", evt.Type, agent.EventTurnCompleted)
+		if evt.Type != agent.EventSessionStarted {
+			t.Errorf("first event type = %q, want %q", evt.Type, agent.EventSessionStarted)
 		}
 	default:
-		t.Error("expected event on eventCh")
+		t.Error("expected session_started event on eventCh")
+	}
+	select {
+	case evt := <-eventCh:
+		if evt.Type != agent.EventTurnCompleted {
+			t.Errorf("second event type = %q, want %q", evt.Type, agent.EventTurnCompleted)
+		}
+	default:
+		t.Error("expected turn_completed event on eventCh")
 	}
 }
 

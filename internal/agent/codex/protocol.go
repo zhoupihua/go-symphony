@@ -236,7 +236,7 @@ type Decoder struct {
 // NewDecoder creates a new Decoder that reads from r.
 func NewDecoder(r io.Reader) *Decoder {
 	s := bufio.NewScanner(r)
-	s.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1MB max buffer
+	s.Buffer(make([]byte, 0, 64*1024), 10*1024*1024) // 10MB max buffer per SPEC §4.1.8
 	return &Decoder{scanner: s}
 }
 

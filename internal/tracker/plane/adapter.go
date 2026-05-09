@@ -35,13 +35,13 @@ func NewAdapter(cfg map[string]any) (tracker.Tracker, error) {
 	projectID := strVal(cfg["project_id"])
 
 	if apiKey == "" {
-		return nil, fmt.Errorf("plane adapter: api_key is required")
+		return nil, tracker.NewTrackerError(tracker.ErrMissingTrackerAPIKey, "plane adapter: api_key is required", nil)
 	}
 	if workspaceSlug == "" {
-		return nil, fmt.Errorf("plane adapter: workspace_slug is required")
+		return nil, tracker.NewTrackerError(tracker.ErrMissingTrackerProject, "plane adapter: workspace_slug is required", nil)
 	}
 	if projectID == "" {
-		return nil, fmt.Errorf("plane adapter: project_id is required")
+		return nil, tracker.NewTrackerError(tracker.ErrMissingTrackerProject, "plane adapter: project_id is required", nil)
 	}
 
 	activeStates := toStringSlice(cfg["active_states"])

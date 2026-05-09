@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -150,55 +149,33 @@ func applyDefaults(s *Schema) {
 	}
 }
 
-// resolveEnvVars walks all string fields in the Schema. If a value starts with
-// '$', it is replaced with the value of the corresponding environment variable.
-// If the env var is unset or empty, a descriptive error is returned.
+// resolveEnvVars resolves $VAR references in config fields that are expected
+// to support environment variable indirection. Per SPEC §6.1, expansion is
+// applied only to values intended to be local filesystem paths or secret
+// tokens, not URIs or arbitrary shell command strings.
 func resolveEnvVars(s *Schema) error {
-	return resolveEnvVarsReflect(reflect.ValueOf(s).Elem(), "")
-}
+	type envField struct {
+		val *string
+		key string
+	}
+	fields := []envField{
+		{&s.Tracker.APIKey, "tracker.api_key"},
+		{&s.Workspace.Root, "workspace.root"},
+		{&s.HA.RaftDir, "ha.raft_dir"},
+	}
 
-// resolveEnvVarsReflect recursively walks struct fields using reflection.
-func resolveEnvVarsReflect(v reflect.Value, path string) error {
-	switch v.Kind() {
-	case reflect.Struct:
-		for i := 0; i < v.NumField(); i++ {
-			field := v.Type().Field(i)
-			// Skip unexported fields
-			if !field.IsExported() {
-				continue
-			}
-			fieldPath := fieldPath(path, field.Name)
-			if err := resolveEnvVarsReflect(v.Field(i), fieldPath); err != nil {
-				return err
-			}
-		}
-	case reflect.Slice:
-		for i := 0; i < v.Len(); i++ {
-			elemPath := fmt.Sprintf("%s[%d]", path, i)
-			if err := resolveEnvVarsReflect(v.Index(i), elemPath); err != nil {
-				return err
-			}
-		}
-	case reflect.String:
-		val := v.String()
-		if strings.HasPrefix(val, "$") {
-			envName := val[1:]
+	for _, f := range fields {
+		if strings.HasPrefix(*f.val, "$") {
+			envName := (*f.val)[1:]
 			resolved := os.Getenv(envName)
 			if resolved == "" {
-				return fmt.Errorf("config field %s: environment variable %s is not set", path, envName)
+				return fmt.Errorf("config field %s: environment variable %s is not set", f.key, envName)
 			}
-			v.SetString(resolved)
+			*f.val = resolved
 		}
 	}
-	return nil
-}
 
-// fieldPath builds a dot-separated field path from parent and child names.
-func fieldPath(parent, child string) string {
-	if parent == "" {
-		return child
-	}
-	return parent + "." + child
+	return nil
 }
 
 // Validate checks the Schema for required fields and valid values.

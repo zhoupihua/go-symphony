@@ -30,6 +30,7 @@ var version = "dev"
 func main() {
 	cfgPath := flag.String("config", "WORKFLOW.md", "path to WORKFLOW.md config file")
 	addr := flag.String("addr", "", "HTTP listen address (overrides config)")
+	port := flag.Int("port", 0, "HTTP listen port (overrides config, 0=ephemeral)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
@@ -156,9 +157,12 @@ func main() {
 	// Start HTTP server.
 	serverCfg := cfg.Server
 	if *addr != "" {
-		host, port := splitHostPort(*addr)
+		host, p := splitHostPort(*addr)
 		serverCfg.Host = host
-		serverCfg.Port = port
+		serverCfg.Port = p
+	}
+	if *port > 0 {
+		serverCfg.Port = *port
 	}
 	maxConcurrent := cfg.Agent.MaxConcurrent
 	if maxConcurrent <= 0 {

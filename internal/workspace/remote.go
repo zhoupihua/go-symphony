@@ -84,6 +84,8 @@ func RemoveRemote(ctx context.Context, sshCfg sshclient.Config, path, root, befo
 
 // RunHookRemote executes a hook script in a remote workspace directory.
 func RunHookRemote(ctx context.Context, sshCfg sshclient.Config, script, workspacePath string, timeout time.Duration) error {
+	slog.Info("hook start (remote)", "path", workspacePath, "host", sshCfg.Host, "timeout", timeout)
+
 	hookCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 

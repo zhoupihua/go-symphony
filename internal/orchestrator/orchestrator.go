@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -227,12 +226,12 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context, cfg config.Schema) 
 		if stallTimeout > 0 {
 			elapsed := time.Since(info.LastActivity)
 			if elapsed > stallTimeout {
-				slog.Warn("stall detected, terminating agent", "issue_id", issueID, "elapsed", elapsed)
+				slog.Warn("stall detected, terminating agent", "issue_id", issueID, "issue_identifier", info.Issue.Identifier, "elapsed", elapsed)
 				o.State.SetPhase(issueID, PhaseStalled)
 				o.State.RemoveRunning(issueID)
 				o.State.ReleaseClaim(issueID)
 				o.addRuntime(info)
-				o.scheduleRetry(issueID, info, false, cfg)
+				o.scheduleRetry(issueID, info, false, cfg, "stall detected")
 				continue
 			}
 		}
@@ -265,13 +264,13 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context, cfg config.Schema) 
 
 		refreshed, found := fetchedMap[issueID]
 		if !found {
-			slog.Warn("reconcile: issue not found in tracker response", "issue_id", issueID)
+			slog.Warn("reconcile: issue not found in tracker response", "issue_id", issueID, "issue_identifier", info.Issue.Identifier)
 			continue
 		}
 
 		if isTerminalState(refreshed.State, cfg.Tracker.TerminalStates) {
 			// Terminal: terminate worker + clean up workspace.
-			slog.Info("issue moved to terminal state, stopping agent", "issue_id", issueID, "state", refreshed.State)
+			slog.Info("issue moved to terminal state, stopping agent", "issue_id", issueID, "issue_identifier", info.Issue.Identifier, "state", refreshed.State)
 			o.State.SetPhase(issueID, PhaseCanceledByReconcile)
 			o.State.RemoveRunning(issueID)
 			o.State.ReleaseClaim(issueID)
@@ -284,7 +283,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context, cfg config.Schema) 
 			// Neither active nor terminal (e.g., "In Review", "Triage"):
 			// terminate worker but don't clean up workspace — the issue
 			// might return to an active state later.
-			slog.Info("issue in non-active non-terminal state, stopping agent without cleanup", "issue_id", issueID, "state", refreshed.State)
+			slog.Info("issue in non-active non-terminal state, stopping agent without cleanup", "issue_id", issueID, "issue_identifier", info.Issue.Identifier, "state", refreshed.State)
 			o.State.SetPhase(issueID, PhaseCanceledByReconcile)
 			o.State.RemoveRunning(issueID)
 			o.State.ReleaseClaim(issueID)
@@ -307,13 +306,16 @@ func (o *Orchestrator) removeWorkspace(ctx context.Context, cfg config.Schema, i
 	}
 }
 
-// addRuntime accumulates ended-session runtime into the state counter.
+// addRuntime accumulates ended-session runtime and token totals into the state counters.
 func (o *Orchestrator) addRuntime(info *RunInfo) {
 	runtimeMs := time.Since(info.StartedAt).Milliseconds()
 	o.State.AddRuntimeMs(runtimeMs)
+	o.State.AddTokens(info.TotalUsage.InputTokens, info.TotalUsage.OutputTokens, info.TotalUsage.TotalTokens)
 }
 
 // processRetries dispatches issues whose retry timer has fired.
+// Per SPEC §16.6, the retry handler only checks concurrency slots,
+// NOT the claimed set — the claim is held across the retry cycle.
 func (o *Orchestrator) processRetries(ctx context.Context, cfg config.Schema) {
 	pending := o.State.PendingRetries()
 	now := time.Now()
@@ -329,29 +331,55 @@ func (o *Orchestrator) processRetries(ctx context.Context, cfg config.Schema) {
 		if o.Tracker != nil {
 			issues, err := o.Tracker.FetchCandidateIssues(ctx)
 			if err != nil {
-				slog.Warn("retry: failed to fetch candidates", "error", err)
+				slog.Warn("retry: failed to fetch candidates, rescheduling", "error", err, "issue_id", issueID, "issue_identifier", entry.Issue.Identifier)
+				// Reschedule retry with incremented attempt per SPEC §16.6.
+				entry.Attempt++
+				entry.FireAt = time.Now().Add(failureRetryDelay(entry.Attempt, cfg))
+				entry.Error = "retry poll failed"
+				o.State.SetRetry(issueID, entry)
 				continue
 			}
 			found := false
 			for _, iss := range issues {
-				if iss.ID == issueID {
+				if strings.EqualFold(iss.ID, issueID) {
 					found = true
 					entry.Issue = iss // refresh issue data
 					break
 				}
 			}
 			if !found {
-				slog.Info("retry: issue no longer in candidate list, releasing claim", "issue_id", issueID)
+				slog.Info("retry: issue no longer in candidate list, releasing claim", "issue_id", issueID, "issue_identifier", entry.Issue.Identifier)
 				o.State.ReleaseClaim(issueID)
 				continue
 			}
 		}
 
-		// Check concurrency limits before re-dispatching.
-		if !o.canDispatch(cfg, entry.Issue) {
-			slog.Info("retry: no available slots, rescheduling", "issue_id", issueID)
-			entry.Attempt++
-			entry.FireAt = time.Now().Add(failureRetryDelay(entry.Attempt, cfg))
+		// Check only concurrency limits (NOT claimed) per SPEC §16.6.
+		// The claim stays held across the retry cycle; canDispatch checks
+		// claimed which would deadlock continuation retries.
+		maxConcurrent := cfg.Agent.MaxConcurrent
+		if maxConcurrent <= 0 {
+			maxConcurrent = 10
+		}
+		hasSlots := o.State.RunningCount() < maxConcurrent
+		if hasSlots {
+			stateCounts := o.State.RunningByState()
+			if limit, ok := cfg.Agent.MaxConcurrentByState[strings.ToLower(entry.Issue.State)]; ok && limit > 0 {
+				if stateCounts[strings.ToLower(entry.Issue.State)] >= limit {
+					hasSlots = false
+				}
+			}
+		}
+		if !hasSlots {
+			slog.Info("retry: no available slots, rescheduling", "issue_id", issueID, "issue_identifier", entry.Issue.Identifier)
+			if entry.IsContinue {
+				// Continuation retries keep their short fixed delay.
+				entry.FireAt = time.Now().Add(continuationRetryDelay)
+			} else {
+				entry.Attempt++
+				entry.FireAt = time.Now().Add(failureRetryDelay(entry.Attempt, cfg))
+			}
+			entry.Error = "no available orchestrator slots"
 			o.State.SetRetry(issueID, entry)
 			continue
 		}
@@ -368,7 +396,7 @@ func (o *Orchestrator) dispatch(ctx context.Context, cfg config.Schema, candidat
 		if !o.canDispatch(cfg, issue) {
 			continue
 		}
-		o.doDispatch(ctx, cfg, issue, 1)
+		o.doDispatch(ctx, cfg, issue, 0)
 	}
 }
 
@@ -441,6 +469,17 @@ func (o *Orchestrator) isBlockedByNonTerminal(issue tracker.Issue, terminalState
 
 // doDispatch starts an agent run for the given issue in a goroutine.
 func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue tracker.Issue, attempt int) {
+	// Preflight validation: ensure required issue fields are present (SPEC §4.1.1).
+	if issue.ID == "" || issue.Identifier == "" || issue.Title == "" || issue.State == "" {
+		slog.Error("skipping issue with missing required fields",
+			"issue_id", issue.ID,
+			"issue_identifier", issue.Identifier,
+			"title", issue.Title,
+			"state", issue.State,
+		)
+		return
+	}
+
 	o.State.Claim(issue.ID)
 
 	workerHost := o.selectWorkerHost(cfg)
@@ -476,7 +515,7 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 		wsPath, createdNow, err = workspace.Create(ctx, cfg.Workspace.Root, issue.Identifier, cfg.Hooks.AfterCreate, hookTimeout)
 	}
 	if err != nil {
-		slog.Error("create workspace for dispatch", "issue_id", issue.ID, "error", err, "host", workerHost)
+		slog.Error("create workspace for dispatch", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "error", err, "host", workerHost)
 		// Clean up if partially created remotely.
 		if workspace.IsRemote(workerHost) && wsPath != "" {
 			_ = workspace.RemoveRemote(ctx, sshCfg, wsPath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeout)
@@ -509,9 +548,9 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 		}
 
 		if err != nil {
-			slog.Error("agent run failed", "issue_id", issue.ID, "error", err, "attempt", attempt)
+			slog.Error("agent run failed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", runInfo.SessionID, "error", err, "attempt", attempt)
 			runInfo.Phase = PhaseFailed
-			o.scheduleRetry(issue.ID, runInfo, false, cfg)
+			o.scheduleRetry(issue.ID, runInfo, false, cfg, fmt.Sprintf("worker exited: %v", err))
 			o.addRuntime(runInfo)
 			return
 		}
@@ -520,10 +559,10 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 			o.State.MarkCompleted(issue.ID)
 			runInfo.Phase = PhaseSucceeded
 			o.addRuntime(runInfo)
-			slog.Info("agent run completed", "issue_id", issue.ID, "turns", result.TotalTurns)
+			slog.Info("agent run completed", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "session_id", runInfo.SessionID, "turns", result.TotalTurns)
 			// Check if issue is still active for continuation retry.
 			if o.Tracker != nil && isActiveState(issue.State, cfg.Tracker.ActiveStates) {
-				o.scheduleRetry(issue.ID, runInfo, true, cfg)
+				o.scheduleRetry(issue.ID, runInfo, true, cfg, "")
 			} else {
 				o.State.ReleaseClaim(issue.ID)
 			}
@@ -532,7 +571,7 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 
 		// Not completed but no error — hit max turns or similar.
 		o.addRuntime(runInfo)
-		o.scheduleRetry(issue.ID, runInfo, true, cfg)
+		o.scheduleRetry(issue.ID, runInfo, true, cfg, "")
 	}()
 
 	// Drain events in a separate goroutine to update state.
@@ -540,6 +579,7 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 		for evt := range eventCh {
 			o.State.UpdateActivity(issue.ID)
 			o.State.SetPhase(issue.ID, PhaseRunningTurns)
+			o.State.UpdateLiveSession(issue.ID, "", "", string(evt.Type), evt.Message, evt.PID)
 			if evt.Usage != nil {
 				o.State.UpdateUsage(issue.ID, *evt.Usage)
 			}
@@ -547,7 +587,7 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 				o.State.UpdateSessionID(issue.ID, evt.SessionID)
 			}
 			if evt.RateLimits != nil {
-				o.State.SetRateLimits(evt.RateLimits)
+				o.State.SetRateLimitsForIssue(issue.ID, evt.RateLimits)
 			}
 			if evt.Type == agent.EventTurnFailed {
 				o.State.UpdateLastError(issue.ID, evt.Message)
@@ -558,7 +598,7 @@ func (o *Orchestrator) doDispatch(ctx context.Context, cfg config.Schema, issue 
 
 // scheduleRetry schedules a retry for an issue.
 // Continuation retries reset attempt to 1; failure retries increment attempt.
-func (o *Orchestrator) scheduleRetry(issueID string, info *RunInfo, isContinue bool, cfg config.Schema) {
+func (o *Orchestrator) scheduleRetry(issueID string, info *RunInfo, isContinue bool, cfg config.Schema, errMsg string) {
 	var attempt int
 	if isContinue {
 		attempt = 1
@@ -578,8 +618,9 @@ func (o *Orchestrator) scheduleRetry(issueID string, info *RunInfo, isContinue b
 		Attempt:    attempt,
 		FireAt:     time.Now().Add(delay),
 		IsContinue: isContinue,
+		Error:      errMsg,
 	})
-	slog.Info("scheduled retry", "issue_id", issueID, "attempt", attempt, "delay", delay, "continuation", isContinue)
+	slog.Info("scheduled retry", "issue_id", issueID, "issue_identifier", info.Issue.Identifier, "attempt", attempt, "delay", delay, "continuation", isContinue)
 }
 
 // failureRetryDelay computes exponential backoff for failure retries.
@@ -595,6 +636,7 @@ func failureRetryDelay(attempt int, cfg config.Schema) time.Duration {
 }
 
 // startupCleanup removes workspaces for issues that are in terminal states.
+// Per SPEC §8.6, this runs on both local and SSH worker hosts.
 func (o *Orchestrator) startupCleanup(ctx context.Context, cfg config.Schema) {
 	if o.Tracker == nil {
 		return
@@ -610,15 +652,26 @@ func (o *Orchestrator) startupCleanup(ctx context.Context, cfg config.Schema) {
 		return
 	}
 
+	hookTimeout := hookTimeoutVal(cfg)
+
 	for _, iss := range issues {
 		if iss.Identifier == "" {
 			continue
 		}
-		key := trackerSanitizeKey(iss.Identifier)
+		key := workspace.SanitizeKey(iss.Identifier)
 		wsPath := cfg.Workspace.Root + "/" + key
-		hookTimeout := hookTimeoutVal(cfg)
+
+		// Clean local workspace.
 		if err := workspace.Remove(ctx, wsPath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeout); err != nil {
-			slog.Warn("startup cleanup: failed to remove workspace", "issue", iss.Identifier, "error", err)
+			slog.Warn("startup cleanup: failed to remove local workspace", "issue_id", iss.ID, "issue_identifier", iss.Identifier, "error", err)
+		}
+
+		// Clean remote workspaces on SSH worker hosts.
+		for _, host := range cfg.Worker.SSHHosts {
+			sshCfg := sshConfigFromHost(host)
+			if err := workspace.RemoveRemote(ctx, sshCfg, wsPath, cfg.Workspace.Root, cfg.Hooks.BeforeRemove, hookTimeout); err != nil {
+				slog.Warn("startup cleanup: failed to remove remote workspace", "issue_id", iss.ID, "issue_identifier", iss.Identifier, "host", host, "error", err)
+			}
 		}
 	}
 }
@@ -650,17 +703,31 @@ func sortIssues(issues []tracker.Issue) {
 }
 
 // isActiveState checks if a state is in the active states list.
+// Comparison is case-insensitive per SPEC §4.2.
 // If no active states are configured, all states are considered active.
 func isActiveState(state string, activeStates []string) bool {
 	if len(activeStates) == 0 {
 		return true
 	}
-	return slices.Contains(activeStates, state)
+	lower := strings.ToLower(state)
+	for _, s := range activeStates {
+		if strings.ToLower(s) == lower {
+			return true
+		}
+	}
+	return false
 }
 
 // isTerminalState checks if a state is in the terminal states list.
+// Comparison is case-insensitive per SPEC §4.2.
 func isTerminalState(state string, terminalStates []string) bool {
-	return slices.Contains(terminalStates, state)
+	lower := strings.ToLower(state)
+	for _, s := range terminalStates {
+		if strings.ToLower(s) == lower {
+			return true
+		}
+	}
+	return false
 }
 
 // cfgPollInterval returns the configured poll interval with a sensible default.
@@ -694,19 +761,6 @@ func hookTimeoutVal(cfg config.Schema) time.Duration {
 		return time.Duration(cfg.Hooks.TimeoutMS) * time.Millisecond
 	}
 	return 60 * time.Second
-}
-
-// trackerSanitizeKey is a simple key sanitizer for workspace paths.
-func trackerSanitizeKey(s string) string {
-	var b []byte
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			b = append(b, byte(r))
-		} else if r == ' ' || r == '/' {
-			b = append(b, '-')
-		}
-	}
-	return string(b)
 }
 
 // sshConfigFromHost parses a "host:port" or "host" string into an sshclient.Config.

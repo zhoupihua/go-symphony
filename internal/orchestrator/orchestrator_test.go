@@ -676,7 +676,7 @@ func TestScheduleRetry_ContinuationAttemptReset(t *testing.T) {
 		LastActivity: time.Now(),
 	}
 
-	o.scheduleRetry("1", info, true, cfg)
+	o.scheduleRetry("1", info, true, cfg, "")
 
 	entry, ok := o.State.RemoveRetry("1")
 	if !ok {
@@ -699,7 +699,7 @@ func TestScheduleRetry_FailureAttemptIncrement(t *testing.T) {
 		LastActivity: time.Now(),
 	}
 
-	o.scheduleRetry("1", info, false, cfg)
+	o.scheduleRetry("1", info, false, cfg, "")
 
 	entry, ok := o.State.RemoveRetry("1")
 	if !ok {
